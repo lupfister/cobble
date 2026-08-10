@@ -419,6 +419,36 @@ struct ProjectSnapshotRecord {
     payload: ProjectGraphSnapshotPayload,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProjectLoadProgressEvent {
+    repo_path: String,
+    status: String,
+    phase: String,
+    progress: u8,
+    error: Option<String>,
+}
+
+fn emit_project_load_progress(
+    app: &tauri::AppHandle,
+    repo_path: &str,
+    status: &str,
+    phase: &str,
+    progress: u8,
+    error: Option<String>,
+) {
+    let _ = app.emit(
+        "project-load-progress",
+        ProjectLoadProgressEvent {
+            repo_path: normalize_repo_path_id(repo_path),
+            status: status.to_string(),
+            phase: phase.to_string(),
+            progress: progress.min(100),
+            error,
+        },
+    );
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FingerprintCheckResult {
@@ -1250,19 +1280,51 @@ fn load_active_project_snapshot(
     }))
 }
 
-fn publish_project_snapshot(
+fn publish_project_snapshot_with_progress(
     repo_path: &str,
     fingerprint_override: Option<&str>,
+    progress: Option<&dyn Fn(&str, u8)>,
 ) -> Result<ProjectSnapshotRecord, String> {
     let normalized_repo_path = normalize_repo_path_id(repo_path);
     if project_is_deleted(&normalized_repo_path)? {
         return Err("Project was removed".to_string());
     }
     let project_id = normalized_repo_path.clone();
-    let snapshot = compute_repo_visual_snapshot(&normalized_repo_path)?;
+    let snapshot = compute_repo_visual_snapshot_with_progress(&normalized_repo_path, progress)?;
     let fingerprint = match fingerprint_override {
         Some(value) => value.to_string(),
-        None => compute_repo_fingerprint(&normalized_repo_path)?.0,
+        None => {
+            let checked_out_ref = snapshot
+                .checked_out_ref
+                .as_ref()
+                .ok_or_else(|| "Snapshot is missing the checked out ref".to_string())?;
+            let path = Path::new(&normalized_repo_path);
+            let upstream_sha = git::resolve_branch_upstream_ref(path, &snapshot.default_branch)
+                .and_then(|upstream_ref| git::cli::run(path, &["rev-parse", &upstream_ref]).ok())
+                .map(|output| output.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let remote_heads_digest = git::compute_remote_heads_digest(path).unwrap_or_default();
+            let local_branch_names: HashSet<String> = git::list_local_branch_heads(path)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let fingerprint_branches: Vec<Branch> = snapshot
+                .branches
+                .iter()
+                .filter(|branch| local_branch_names.contains(&branch.name))
+                .cloned()
+                .collect();
+            compose_repo_fingerprint(
+                &snapshot.default_branch,
+                checked_out_ref,
+                &fingerprint_branches,
+                &snapshot.worktrees,
+                &snapshot.stashes,
+                upstream_sha,
+                remote_heads_digest,
+            )
+        }
     };
     let (clumps, simple_nodes) = build_simple_graph_projection(&snapshot);
     let payload = ProjectGraphSnapshotPayload {
@@ -1368,23 +1430,36 @@ fn publish_project_snapshot(
     })
 }
 
+fn publish_project_snapshot(
+    repo_path: &str,
+    fingerprint_override: Option<&str>,
+) -> Result<ProjectSnapshotRecord, String> {
+    publish_project_snapshot_with_progress(repo_path, fingerprint_override, None)
+}
+
 fn fetch_all_merge_nodes_for_branches_internal(
     repo_path: &str,
     branches: &[Branch],
     default_branch: &str,
 ) -> Result<Vec<MergeNode>, String> {
     let path = Path::new(repo_path);
-    let branch_names: Vec<String> = std::iter::once(default_branch.to_string())
+    let mut branch_names: Vec<String> = std::iter::once(default_branch.to_string())
         .chain(branches.iter().map(|branch| branch.name.clone()))
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    branch_names.sort();
+    if let Some(default_index) = branch_names.iter().position(|name| name == default_branch) {
+        branch_names.swap(0, default_index);
+    }
     let mut deduped = HashMap::<String, MergeNode>::new();
     for branch_name in branch_names {
         let mut page = 0;
         loop {
-            let (nodes, has_more) = git::get_merge_commits(path, &branch_name, None, page, 100)
-                .map_err(|e| e.to_string())?;
+            let exclude_ref = (branch_name != default_branch).then_some(default_branch);
+            let (nodes, has_more) =
+                git::get_merge_commits(path, &branch_name, exclude_ref, page, 100)
+                    .map_err(|e| e.to_string())?;
             for node in nodes {
                 let key = format!("{}:{}", node.target_commit_sha, node.target_branch);
                 deduped.entry(key).or_insert(node);
@@ -1399,6 +1474,19 @@ fn fetch_all_merge_nodes_for_branches_internal(
 }
 
 fn compute_repo_visual_snapshot(repo_path: &str) -> Result<RepoVisualSnapshot, String> {
+    compute_repo_visual_snapshot_with_progress(repo_path, None)
+}
+
+fn compute_repo_visual_snapshot_with_progress(
+    repo_path: &str,
+    progress: Option<&dyn Fn(&str, u8)>,
+) -> Result<RepoVisualSnapshot, String> {
+    let report = |phase: &str, value: u8| {
+        if let Some(callback) = progress {
+            callback(phase, value);
+        }
+    };
+    report("Reading repository", 8);
     let path = Path::new(repo_path);
     let (name, resolved_path) = git::get_repo_info(path).map_err(|e| e.to_string())?;
     let default_branch = git::get_default_branch(path).map_err(|e| e.to_string())?;
@@ -1413,6 +1501,7 @@ fn compute_repo_visual_snapshot(repo_path: &str) -> Result<RepoVisualSnapshot, S
             other => other,
         }
     });
+    report("Reading branches", 18);
     let merge_nodes =
         fetch_all_merge_nodes_for_branches_internal(&resolved_path, &branches, &default_branch)?;
     let merge_target_branch_by_commit_sha: HashMap<String, String> = merge_nodes
@@ -1439,6 +1528,7 @@ fn compute_repo_visual_snapshot(repo_path: &str) -> Result<RepoVisualSnapshot, S
             branch_created_dates.insert(default_branch.clone(), default_date);
         }
     }
+    report("Building commit graph", 35);
     let direct_commits = git::get_all_repo_commits(
         path,
         &default_branch,
@@ -1473,6 +1563,7 @@ fn compute_repo_visual_snapshot(repo_path: &str) -> Result<RepoVisualSnapshot, S
         }
     }
 
+    report("Reading remote branches", 58);
     let origin_branch_heads = git::list_origin_branch_heads(path).map_err(|e| e.to_string())?;
 
     // Cleanup database: remove deleted_remote_branches entries that are no longer present on the remote at all
@@ -1554,9 +1645,11 @@ fn compute_repo_visual_snapshot(repo_path: &str) -> Result<RepoVisualSnapshot, S
     }
     branches.extend(remote_only_branches);
     branches.sort_by(|left, right| right.last_commit_date.cmp(&left.last_commit_date));
+    report("Checking branch state", 70);
     let unpushed_direct_commits =
         get_unpushed_direct_commits_blocking(resolved_path.clone(), default_branch.clone())?;
     let checked_out_ref = git::get_checked_out_ref(path).ok();
+    report("Checking worktrees", 78);
     let worktrees = git::list_worktrees(path).unwrap_or_default();
     let stashes = git::list_stashes(path).unwrap_or_default();
 
@@ -1658,6 +1751,7 @@ fn compute_repo_visual_snapshot(repo_path: &str) -> Result<RepoVisualSnapshot, S
         }
     }
 
+    report("Preparing map", 90);
     let mut branch_commit_previews = HashMap::<String, Vec<BranchCommitPreviewEntry>>::new();
     let mut branch_unique_ahead_counts = HashMap::<String, i32>::new();
     for branch in &active_branches {
@@ -1786,8 +1880,7 @@ fn compute_repo_visual_snapshot(repo_path: &str) -> Result<RepoVisualSnapshot, S
     })
 }
 
-#[tauri::command]
-fn watch_repo(repo_path: String, app: tauri::AppHandle) -> Result<(), String> {
+fn watch_repo_blocking(repo_path: String, app: tauri::AppHandle) -> Result<(), String> {
     let repo_root = Path::new(&repo_path);
     let repo_root_canonical = repo_root
         .canonicalize()
@@ -1825,22 +1918,22 @@ fn watch_repo(repo_path: String, app: tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     };
 
-    let normalized_repo_path = repo_root.to_string_lossy().to_string();
+    let event_repo_path = repo_root.to_string_lossy().to_string();
+    let watcher_key = normalize_repo_path_id(&event_repo_path);
     {
         let lock = WATCHER_STATE
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap();
-        if lock.contains_key(&normalized_repo_path) {
+        if lock.contains_key(&watcher_key) {
             return Ok(());
         }
     }
 
-    let linked_worktree_roots: Vec<PathBuf> = git::list_worktrees(&repo_root_canonical)
+    let linked_worktree_roots: Vec<PathBuf> = git::list_worktree_paths(&repo_root_canonical)
         .unwrap_or_default()
         .into_iter()
-        .filter(|wt| wt.path_exists)
-        .map(|wt| PathBuf::from(wt.path))
+        .map(PathBuf::from)
         .filter(|path| path.exists())
         .map(|path| path.canonicalize().unwrap_or(path))
         .filter(|path| !worktree_watch_roots_same(&repo_root_canonical, path))
@@ -1868,7 +1961,7 @@ fn watch_repo(repo_path: String, app: tauri::AppHandle) -> Result<(), String> {
             git_roots.push(common_dir);
         }
     }
-    let repo_path_for_events = normalized_repo_path.clone();
+    let repo_path_for_events = event_repo_path;
     let repo_root_for_events = repo_root_canonical.clone();
     let linked_worktree_roots_for_events = linked_worktree_roots.clone();
     let app_for_worktree_debounce = app.clone();
@@ -2023,8 +2116,31 @@ fn watch_repo(repo_path: String, app: tauri::AppHandle) -> Result<(), String> {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap();
-    lock.insert(normalized_repo_path, watcher);
+    lock.insert(watcher_key, watcher);
 
+    Ok(())
+}
+
+#[tauri::command]
+async fn watch_repo(repo_path: String, app: tauri::AppHandle) -> Result<(), String> {
+    run_blocking(move || watch_repo_blocking(repo_path, app)).await
+}
+
+#[tauri::command]
+fn unwatch_repo(repo_path: String) -> Result<(), String> {
+    let normalized_repo_path = normalize_repo_path_id(&repo_path);
+    if let Some(state) = WATCHER_STATE.get() {
+        state
+            .lock()
+            .map_err(|_| "Repo watcher state lock poisoned".to_string())?
+            .remove(&normalized_repo_path);
+    }
+    if let Some(activity) = WATCHER_ACTIVITY.get() {
+        activity
+            .lock()
+            .map_err(|_| "Repo watcher activity lock poisoned".to_string())?
+            .remove(&normalized_repo_path);
+    }
     Ok(())
 }
 
@@ -2348,10 +2464,19 @@ async fn get_repo_visual_snapshot(
 async fn add_project_and_ingest(
     repo_path: String,
     force_refresh: Option<bool>,
+    app: tauri::AppHandle,
 ) -> Result<ProjectSnapshotRecord, String> {
     run_blocking(move || {
         let normalized_repo_path = normalize_repo_path_id(&repo_path);
-        repo_git_gate::with_repo_git_lock(&normalized_repo_path, || {
+        emit_project_load_progress(
+            &app,
+            &normalized_repo_path,
+            "loading",
+            "Checking repository",
+            3,
+            None,
+        );
+        let result = repo_git_gate::with_repo_git_lock(&normalized_repo_path, || {
             DELETED_PROJECTS
                 .get_or_init(|| Mutex::new(HashSet::new()))
                 .lock()
@@ -2361,18 +2486,47 @@ async fn add_project_and_ingest(
             let force_refresh = force_refresh.unwrap_or(false);
             let conn = open_visual_cache_connection()?;
             let existing = load_active_project_snapshot(&conn, &project_id)?;
-            let (current_fingerprint, _) = compute_repo_fingerprint_inner(&normalized_repo_path)?;
             if !force_refresh {
                 if let Some(active) = existing {
-                    if active.fingerprint == current_fingerprint
-                        && active.schema_version == PROJECT_SNAPSHOT_SCHEMA_VERSION
+                    let probe = match repo_git_gate::cached_probe(&normalized_repo_path) {
+                        Some(probe) => probe,
+                        None => compute_repo_change_probe_inner(&normalized_repo_path)?,
+                    };
+                    if active.schema_version == PROJECT_SNAPSHOT_SCHEMA_VERSION
+                        && probe_lite_matches_fingerprint(&probe, &active.fingerprint)
                     {
                         return Ok(active);
                     }
                 }
             }
-            publish_project_snapshot(&normalized_repo_path, Some(&current_fingerprint))
-        })
+            let progress_app = app.clone();
+            let progress_repo_path = normalized_repo_path.clone();
+            let progress = move |phase: &str, value: u8| {
+                emit_project_load_progress(
+                    &progress_app,
+                    &progress_repo_path,
+                    "loading",
+                    phase,
+                    value,
+                    None,
+                );
+            };
+            publish_project_snapshot_with_progress(&normalized_repo_path, None, Some(&progress))
+        });
+        match &result {
+            Ok(_) => {
+                emit_project_load_progress(&app, &normalized_repo_path, "ready", "Ready", 100, None)
+            }
+            Err(error) => emit_project_load_progress(
+                &app,
+                &normalized_repo_path,
+                "error",
+                "Load failed",
+                100,
+                Some(error.clone()),
+            ),
+        }
+        result
     })
     .await
 }
@@ -6578,6 +6732,7 @@ fn get_unpushed_direct_commits_blocking(
         &[
             "log",
             "--first-parent",
+            "--max-count=2000",
             "--format=%H%x1f%h%x1f%s%x1f%an%x1f%cI%x1f%P",
             &range,
         ],
@@ -6656,8 +6811,11 @@ fn get_branch_unpushed_commit_shas_blocking(
         let default_branch = git::get_default_branch(path).map_err(|e| e.to_string())?;
         format!("{default_branch}..{branch}")
     };
-    let output =
-        git::cli::run(path, &["rev-list", "--first-parent", &range]).map_err(|e| e.to_string())?;
+    let output = git::cli::run(
+        path,
+        &["rev-list", "--first-parent", "--max-count=2000", &range],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(output
         .lines()
         .map(str::trim)
@@ -9224,6 +9382,7 @@ pub fn run() {
             take_pending_open_repo,
             reveal_in_finder,
             watch_repo,
+            unwatch_repo,
             get_repo_watcher_epochs,
             check_network_available,
         ])

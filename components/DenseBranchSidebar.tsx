@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
-import { ChevronRight, Plus, Trash2 } from 'lucide-react';
+import { ChevronRight, LoaderCircle, Plus, Trash2 } from 'lucide-react';
 import CobblePlusIcon from './CobblePlusIcon';
 import { ToolbarSvgIcon } from './grid/ToolbarActionContent';
 import type { Branch, BranchCommitPreview, TerminalSession, WorktreeInfo } from '../types';
@@ -85,6 +85,12 @@ type Props = {
   ) => void;
   onCloseContextMenu?: () => void;
   projectLoading?: boolean;
+  projectLoadStates?: Record<string, {
+    status: 'loading' | 'ready' | 'error';
+    phase: string;
+    progress: number;
+    error?: string | null;
+  }>;
   projectError?: string | null;
   className?: string;
   style?: CSSProperties;
@@ -175,6 +181,7 @@ export default function DenseBranchSidebar({
   onShowContextMenu,
   onCloseContextMenu,
   projectLoading,
+  projectLoadStates = {},
   projectError,
   className,
   style,
@@ -971,6 +978,8 @@ export default function DenseBranchSidebar({
     const projectSessions = sessionsByProject.get(normalizeRepoPathForCompare(project.path).toLowerCase()) ?? [];
     const commitPreviews = commitPreviewSessions(projectSessions);
     const sortedWts = sortWorktreesForProject(project);
+    const loadState = projectLoadStates[projectKey];
+    const isLoading = loadState?.status === 'loading';
 
     return (
       <div className={cn(hideLive && 'pointer-events-none opacity-0')}>
@@ -1016,6 +1025,16 @@ export default function DenseBranchSidebar({
             )}
           </button>
           <span className="min-w-0 flex-1 truncate text-sm">{project.name}</span>
+          {isLoading ? (
+            <span
+              className="ml-2 inline-flex shrink-0 items-center gap-1 pr-2 text-xs text-muted-foreground"
+              aria-live="polite"
+              title={loadState.phase}
+            >
+              <LoaderCircle strokeWidth={1.5} className="h-3.5 w-3.5 shrink-0 animate-spin" />
+              <span>{Math.max(1, Math.round(loadState.progress))}%</span>
+            </span>
+          ) : null}
         </div>
         {isExpanded ? (
           <div className="mt-1 space-y-1">

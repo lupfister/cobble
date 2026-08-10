@@ -830,6 +830,7 @@ export default function BranchGridMap({
   }, [nodeByCommitId, selectedVisibleCommitShas]);
 
   const layoutDebugJson = useMemo(() => {
+    if (!isDebugOpen) return undefined;
     const nodeByVisualId = new Map(renderNodes.map((node) => [node.commit.visualId, node] as const));
     const selectedIds = new Set(selectedVisibleCommitShas);
     const worktreeIds = new Set(worktreeSessions.map((session) => session.workingTreeId));
@@ -884,6 +885,7 @@ export default function BranchGridMap({
     checkedOutRef,
     connectorsForView,
     currentRepoPath,
+    isDebugOpen,
     layoutNodes.length,
     mergeConnectorsForView,
     nodePositionOverrides,
@@ -1856,12 +1858,6 @@ export default function BranchGridMap({
     const attempts = previousRecovery?.key === recoveryKey ? previousRecovery.attempts + 1 : 1;
     autoRecoverRef.current = { key: recoveryKey, attempts };
 
-    if (attempts >= 2) {
-      // Safety valve: if culling still reports nothing after recentering, render all commits.
-      setVisibleNodeIds(new Set(renderNodes.map((node) => node.commit.visualId)));
-      return;
-    }
-
     let minX = Infinity;
     let minY = Infinity;
     let maxX = -Infinity;
@@ -1877,6 +1873,18 @@ export default function BranchGridMap({
     const centerY = (minY + maxY) / 2;
     const viewportRect = viewport.getBoundingClientRect();
     const targetZoom = renderedCameraRef.current.zoom;
+    if (attempts >= 2) {
+      const candidateIds = new Set(renderNodes.map((node) => node.commit.visualId));
+      setVisibleNodeIds(pickNearestVisibleVisualIds(
+        candidateIds,
+        mapGridMaxVisibleNodeRetain(targetZoom / GRID_RENDER_ZOOM),
+        nodeByVisualId,
+        centerX,
+        centerY,
+        nodePositionOverrides,
+      ));
+      return;
+    }
     const scale = targetZoom / GRID_RENDER_ZOOM;
     const targetScreenX = viewportRect.left + viewportRect.width / 2;
     const targetScreenY = viewportRect.top + viewportRect.height / 2;
@@ -1895,6 +1903,7 @@ export default function BranchGridMap({
     mapReadyEpoch,
     contentWidth,
     contentHeight,
+    nodeByVisualId,
     getTransformLayerOriginScreen,
     renderedCameraRef,
     syncCamera,

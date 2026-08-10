@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const MAX_CONCURRENT_GIT_OPS: usize = 8;
+// Full graph loads can consume substantial CPU and memory. A small global cap
+// keeps background ingests from saturating the machine.
+const MAX_CONCURRENT_GIT_OPS: usize = 2;
 const PROBE_CACHE_TTL: Duration = Duration::from_millis(1500);
 
 struct ProbeCacheEntry {

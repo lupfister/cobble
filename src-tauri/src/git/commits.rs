@@ -4,6 +4,28 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 const LOG_FIELD_SEPARATOR: &str = "\u{1f}";
+const MAX_REPO_GRAPH_COMMITS: usize = 20_000;
+const MAX_GRAPH_COMMIT_BRANCH_PAIRS: usize = 500_000;
+const MIN_REPO_GRAPH_COMMITS: usize = 500;
+const MAX_REMOTE_RANGE_COMMITS: usize = 2_000;
+
+fn repo_graph_commit_limit(branch_count: usize) -> usize {
+    (MAX_GRAPH_COMMIT_BRANCH_PAIRS / branch_count.max(1))
+        .clamp(MIN_REPO_GRAPH_COMMITS, MAX_REPO_GRAPH_COMMITS)
+}
+
+#[cfg(test)]
+mod graph_limit_tests {
+    use super::repo_graph_commit_limit;
+
+    #[test]
+    fn scales_commit_history_down_as_branch_count_grows() {
+        assert_eq!(repo_graph_commit_limit(1), 20_000);
+        assert_eq!(repo_graph_commit_limit(50), 10_000);
+        assert_eq!(repo_graph_commit_limit(100), 5_000);
+        assert_eq!(repo_graph_commit_limit(2_000), 500);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,13 +184,23 @@ fn append_commits_from_log_range(
     is_remote: bool,
     commits: &mut Vec<DirectCommit>,
 ) -> Result<(), GitError> {
+    let remaining = MAX_REPO_GRAPH_COMMITS.saturating_sub(commits.len());
+    if remaining == 0 {
+        return Ok(());
+    }
+    let limit = remaining.min(MAX_REMOTE_RANGE_COMMITS);
     let existing_shas: HashSet<String> = commits
         .iter()
         .map(|commit| commit.full_sha.clone())
         .collect();
     let output = cli::run(
         repo,
-        &["log", range, "--format=%H%x1f%h%x1f%s%x1f%an%x1f%cI%x1f%P"],
+        &[
+            "log",
+            range,
+            &format!("--max-count={limit}"),
+            "--format=%H%x1f%h%x1f%s%x1f%an%x1f%cI%x1f%P",
+        ],
     )?;
     let parsed: Vec<ParsedCommitLine> = output
         .lines()
@@ -205,8 +237,10 @@ pub fn get_all_repo_commits(
         .collect();
     refs.sort();
     refs.dedup();
+    let graph_commit_limit = repo_graph_commit_limit(refs.len());
     let mut args: Vec<String> = vec![
         "log".to_string(),
+        format!("--max-count={graph_commit_limit}"),
         "--format=%H%x1f%h%x1f%s%x1f%an%x1f%cI%x1f%P".to_string(),
     ];
     args.extend(refs);
@@ -226,7 +260,15 @@ pub fn get_all_repo_commits(
     non_default_branches.reverse();
 
     let mut default_first_parent_set = HashSet::<String>::new();
-    let default_fp_output = cli::run(repo, &["rev-list", "--first-parent", default_branch])?;
+    let default_fp_output = cli::run(
+        repo,
+        &[
+            "rev-list",
+            "--first-parent",
+            &format!("--max-count={graph_commit_limit}"),
+            default_branch,
+        ],
+    )?;
     for sha in default_fp_output
         .lines()
         .map(str::trim)
@@ -427,15 +469,16 @@ pub fn get_all_repo_commits(
                 child_sha_by_branch.insert(branch_name.clone(), cursor.clone());
                 break;
             };
-            let parent_reached_by_older_branch = branch_order
-                .iter()
-                .enumerate()
-                .any(|(other_index, other_name)| {
-                    other_name != branch_name
-                        && is_branch_older(other_name, other_index, branch_name, branch_index)
-                        && first_parent_distance_by_commit_sha_and_branch
-                            .contains_key(&(parent_sha.clone(), other_name.clone()))
-                });
+            let parent_reached_by_older_branch =
+                branch_order
+                    .iter()
+                    .enumerate()
+                    .any(|(other_index, other_name)| {
+                        other_name != branch_name
+                            && is_branch_older(other_name, other_index, branch_name, branch_index)
+                            && first_parent_distance_by_commit_sha_and_branch
+                                .contains_key(&(parent_sha.clone(), other_name.clone()))
+                    });
             if parent_reached_by_older_branch {
                 child_sha_by_branch.insert(branch_name.clone(), cursor.clone());
                 break;

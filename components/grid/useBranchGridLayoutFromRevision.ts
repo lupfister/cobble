@@ -59,19 +59,25 @@ const EMPTY_LAYOUT_MODEL: BranchGridLayoutModel = {
   mergeTargetBranchesBySourceBranchAndCommitSha: new Map(),
 };
 
-let sharedLayoutWorker: Worker | null = null;
+const MAX_MAIN_THREAD_FALLBACK_NODES = 1_500;
 
-const getLayoutWorker = (): Worker | null => {
+const createLayoutWorker = (): Worker | null => {
   if (typeof Worker === 'undefined') return null;
-  if (sharedLayoutWorker) return sharedLayoutWorker;
   try {
-    sharedLayoutWorker = new Worker(new URL('./branchGridLayoutWorker.ts', import.meta.url), {
+    return new Worker(new URL('./branchGridLayoutWorker.ts', import.meta.url), {
       type: 'module',
     });
-    return sharedLayoutWorker;
   } catch {
     return null;
   }
+};
+
+export type BranchGridLayoutStatus = {
+  state: 'idle' | 'computing' | 'ready' | 'error';
+  source: 'none' | 'cache' | 'worker' | 'main-small';
+  nodeEstimate: number;
+  durationMs: number | null;
+  error: string | null;
 };
 
 const resolveCachedLayoutModel = (
@@ -151,6 +157,7 @@ export const useBranchGridLayoutFromRevision = (params: {
   hydratedLayoutKey: string | null;
   mapLoading: boolean;
   layoutModelCacheRef: MutableRefObject<Map<string, BranchGridLayoutModel>>;
+  onStatusChange?: (status: BranchGridLayoutStatus) => void;
 }): BranchGridLayoutModel => {
   const {
     layoutRevisionForView,
@@ -159,6 +166,7 @@ export const useBranchGridLayoutFromRevision = (params: {
     hydratedLayoutKey,
     mapLoading,
     layoutModelCacheRef,
+    onStatusChange,
   } = params;
 
   const lastGoodModelRef = useRef<BranchGridLayoutModel>(EMPTY_LAYOUT_MODEL);
@@ -205,12 +213,10 @@ export const useBranchGridLayoutFromRevision = (params: {
     [layoutRevisionForView],
   );
 
-  const immediateLayoutModel = useMemo(() => {
-    if (resolved.source !== 'needs-compute') return null;
-    if (lastGoodModelRef.current.allCommits.length === 0) return null;
-    if (lastGoodGraphSignatureRef.current !== layoutRevisionForView.graphLayoutSignature) return null;
-    return computeBranchGridLayoutWithPerf(layoutInput);
-  }, [layoutInput, layoutRevisionForView.graphLayoutSignature, resolved.source]);
+  const nodeEstimate =
+    layoutInput.directCommits.length
+    + layoutInput.unpushedDirectCommits.length
+    + layoutInput.branches.length;
 
   useEffect(() => {
     if (resolved.source !== 'needs-compute') {
@@ -218,28 +224,30 @@ export const useBranchGridLayoutFromRevision = (params: {
       if (resolved.model && layoutComputeKey) {
         lastServedComputeKeyRef.current = layoutComputeKey;
       }
+      onStatusChange?.({
+        state: resolved.model ? 'ready' : 'idle',
+        source: resolved.model ? 'cache' : 'none',
+        nodeEstimate,
+        durationMs: 0,
+        error: null,
+      });
       return undefined;
     }
 
     const jobId = jobIdRef.current + 1;
     jobIdRef.current = jobId;
+    const startedAt = performance.now();
+    onStatusChange?.({
+      state: 'computing',
+      source: 'worker',
+      nodeEstimate,
+      durationMs: null,
+      error: null,
+    });
 
-    if (immediateLayoutModel) {
-      if (sharedGridLayoutCacheKey) {
-        layoutModelCacheRef.current.set(sharedGridLayoutCacheKey, immediateLayoutModel);
-      }
-      if (layoutComputeKey) {
-        lastServedComputeKeyRef.current = layoutComputeKey;
-      }
-      startTransition(() => {
-        setAsyncLayout({ computeKey: layoutComputeKey, model: immediateLayoutModel });
-      });
-      return undefined;
-    }
+    const worker = createLayoutWorker();
 
-    const worker = getLayoutWorker();
-
-    const applyModel = (model: BranchGridLayoutModel) => {
+    const applyModel = (model: BranchGridLayoutModel, source: BranchGridLayoutStatus['source']) => {
       if (jobId !== jobIdRef.current) return;
       if (sharedGridLayoutCacheKey) {
         layoutModelCacheRef.current.set(sharedGridLayoutCacheKey, model);
@@ -250,41 +258,72 @@ export const useBranchGridLayoutFromRevision = (params: {
       startTransition(() => {
         setAsyncLayout({ computeKey: layoutComputeKey, model });
       });
+      onStatusChange?.({
+        state: 'ready',
+        source,
+        nodeEstimate,
+        durationMs: performance.now() - startedAt,
+        error: null,
+      });
     };
 
     if (worker) {
-      let didResolve = false;
+      const reportWorkerError = (message: string) => {
+        if (jobId !== jobIdRef.current) return;
+        onStatusChange?.({
+          state: 'error',
+          source: 'worker',
+          nodeEstimate,
+          durationMs: performance.now() - startedAt,
+          error: message,
+        });
+      };
       const handleMessage = (event: MessageEvent<BranchGridLayoutWorkerResponse>) => {
         if (event.data.jobId !== jobId) return;
-        didResolve = true;
         if (!event.data.ok) {
           console.warn('branch grid layout worker failed:', event.data.error);
-          applyModel(computeBranchGridLayoutWithPerf(layoutInput));
+          reportWorkerError(event.data.error);
+          worker.terminate();
           return;
         }
-        applyModel(hydrateBranchGridLayoutModel(event.data.serialized));
+        applyModel(hydrateBranchGridLayoutModel(event.data.serialized), 'worker');
+        worker.terminate();
+      };
+      const handleError = (event: ErrorEvent) => {
+        reportWorkerError(event.message || 'The map worker stopped unexpectedly.');
+        worker.terminate();
       };
       worker.addEventListener('message', handleMessage);
-      const fallbackId = window.setTimeout(() => {
-        if (didResolve || jobId !== jobIdRef.current) return;
-        didResolve = true;
-        worker.removeEventListener('message', handleMessage);
-        applyModel(computeBranchGridLayoutWithPerf(layoutInput));
-      }, 1200);
+      worker.addEventListener('error', handleError);
       const request: BranchGridLayoutWorkerRequest = {
         jobId,
         input: toWorkerBranchGridLayoutInput(layoutInput),
       };
       worker.postMessage(request);
       return () => {
-        window.clearTimeout(fallbackId);
         worker.removeEventListener('message', handleMessage);
+        worker.removeEventListener('error', handleError);
+        worker.terminate();
       };
     }
 
-    applyModel(computeBranchGridLayoutWithPerf(layoutInput));
-    return undefined;
-  }, [layoutComputeKey, resolved.source, layoutInput, immediateLayoutModel]);
+    if (nodeEstimate > MAX_MAIN_THREAD_FALLBACK_NODES) {
+      onStatusChange?.({
+        state: 'error',
+        source: 'none',
+        nodeEstimate,
+        durationMs: performance.now() - startedAt,
+        error: 'The map worker could not start for this large repository.',
+      });
+      return undefined;
+    }
+
+    const fallbackId = window.setTimeout(() => {
+      if (jobId !== jobIdRef.current) return;
+      applyModel(computeBranchGridLayoutWithPerf(layoutInput), 'main-small');
+    }, 0);
+    return () => window.clearTimeout(fallbackId);
+  }, [layoutComputeKey, resolved.source, resolved.model, layoutInput, nodeEstimate, onStatusChange]);
 
   const asyncLayoutModel = asyncLayout?.computeKey === layoutComputeKey ? asyncLayout.model : null;
   const isSameRepo =
@@ -292,7 +331,6 @@ export const useBranchGridLayoutFromRevision = (params: {
     lastGoodRepoPathRef.current === layoutRevisionForView.repoPath;
   const layoutModel =
     asyncLayoutModel
-    ?? immediateLayoutModel
     ?? resolved.model
     ?? (
       isSameRepo

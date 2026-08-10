@@ -3,6 +3,7 @@ import { flushSync } from 'react-dom';
 import type { SetStateAction } from 'react';
 import { invoke } from './timedInvoke';
 import { listen } from '@tauri-apps/api/event';
+import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWindow, LogicalPosition, LogicalSize } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
 import { PanelLeftClose, PanelLeftOpen } from 'lucide-react';
@@ -22,7 +23,10 @@ import {
 import type { BranchGridLayoutModel } from '../components/grid/branchGridLayoutModel';
 import { hydrateBranchGridLayoutModel, serializeBranchGridLayoutModel } from '../components/grid/layoutSnapshot';
 import { buildGraphLayoutFingerprint, hashCommitShaList } from '../components/grid/graphLayoutFingerprint';
-import { useBranchGridLayoutFromRevision } from '../components/grid/useBranchGridLayoutFromRevision';
+import {
+  useBranchGridLayoutFromRevision,
+  type BranchGridLayoutStatus,
+} from '../components/grid/useBranchGridLayoutFromRevision';
 import { layoutModelHasWorkingTree } from '../components/grid/workingTreeLayout';
 import type { Branch, BranchCommitPreview, BranchPromptMeta, CheckedOutRef, CommitMutationData, DeleteSelectionMutationData, DirectCommit, GitHubAuthStatus, GitHubInfo, GitStashEntry, MergeNode, OpenPR, RepoMutationOutcome, RepoVisualSnapshot, StashPushMutationData, StashRestoreMutationData, TerminalSession, WorktreeInfo, RepoQuickState } from '../types';
 import {
@@ -117,6 +121,14 @@ type GitActivityEventPayload = {
   repoPath: string;
   kind: 'graph' | 'local';
 };
+type ProjectLoadProgressEvent = {
+  repoPath: string;
+  status: 'loading' | 'ready' | 'error';
+  phase: string;
+  progress: number;
+  error?: string | null;
+};
+type ProjectLoadState = Omit<ProjectLoadProgressEvent, 'repoPath'>;
 const COMMIT_SWITCH_FEEDBACK_VISIBLE_MS = 1400;
 const COMMIT_SWITCH_FEEDBACK_FADE_MS = 180;
 const SIDEBAR_WIDTH_STORAGE_KEY = 'cobble:sidebar-width';
@@ -209,6 +221,10 @@ function normalizePath(path: string): string {
 function sameRepoPath(left: string | null | undefined, right: string | null | undefined): boolean {
   if (!left || !right) return false;
   return normalizePath(left).toLowerCase() === normalizePath(right).toLowerCase();
+}
+
+function projectLoadKey(path: string): string {
+  return normalizePath(path).toLowerCase();
 }
 
 function sortWorktrees(worktrees: WorktreeInfo[], order?: string[]): WorktreeInfo[] {
@@ -347,6 +363,7 @@ function App() {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [projectSnapshots, setProjectSnapshots] = useState<Record<string, ProjectSnapshot>>({});
   const [projectTreeLoading, setProjectTreeLoading] = useState(false);
+  const [projectLoadStates, setProjectLoadStates] = useState<Record<string, ProjectLoadState>>({});
   const [branches, setBranches] = useState<Branch[]>([]);
   const [mergeNodes, setMergeNodes] = useState<MergeNode[]>([]);
   const [directCommits, setDirectCommits] = useState<DirectCommit[]>([]);
@@ -368,6 +385,13 @@ function App() {
   const [mapSwitchEpoch, setMapSwitchEpoch] = useState(0);
   const [mapReadyForDisplay, setMapReadyForDisplay] = useState(false);
   const [mapPresentationState, setMapPresentationState] = useState<MapPresentationState>('loading');
+  const [mapLayoutStatus, setMapLayoutStatus] = useState<BranchGridLayoutStatus>({
+    state: 'idle',
+    source: 'none',
+    nodeEstimate: 0,
+    durationMs: null,
+    error: null,
+  });
   const [pendingInitialProjectPath, setPendingInitialProjectPath] = useState<string | null>(null);
   const [isEmptyAddProjectHovered, setIsEmptyAddProjectHovered] = useState(false);
   const [projectsHydrated, setProjectsHydrated] = useState(false);
@@ -383,6 +407,7 @@ function App() {
   }, [projects.length, projectsHydrated]);
 
   const [error, setError] = useState<string | null>(null);
+  const [diagnosticsCopyFeedback, setDiagnosticsCopyFeedback] = useState<string | null>(null);
   const [previewSetupOpen, setPreviewSetupOpen] = useState(false);
   const [previewDraftConfig, setPreviewDraftConfig] = useState<ProjectPreviewConfig | null>(null);
   const [pendingPreviewTarget, setPendingPreviewTarget] = useState<PreviewTarget | null>(null);
@@ -1191,6 +1216,32 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
     }
   }, [repoPath]);
 
+  useEffect(() => {
+    let isDisposed = false;
+    let unlisten: (() => void) | null = null;
+    listen<ProjectLoadProgressEvent>('project-load-progress', (event) => {
+      if (isDisposed) return;
+      const payload = event.payload;
+      const key = projectLoadKey(payload.repoPath);
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [key]: {
+          status: payload.status,
+          phase: payload.phase,
+          progress: payload.progress,
+          error: payload.error,
+        },
+      }));
+    }).then((fn) => {
+      if (isDisposed) fn();
+      else unlisten = fn;
+    }).catch(console.error);
+    return () => {
+      isDisposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   const mergeTargetBranchByCommitSha = useMemo(
     () =>
       mergeNodes.reduce<Record<string, string>>((map, node) => {
@@ -1433,18 +1484,20 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
         const otherProjects = projects.filter(
           (project) => !activePath || normalizePath(project.path) !== normalizePath(activePath),
         );
-        const hydrateProject = async (projectPath: string) => {
-          await loadProjectSnapshot(projectPath, false, false);
-        };
         if (otherProjects.length > 0) {
           void (async () => {
-            await Promise.all(otherProjects.map((project) => hydrateProject(project.path)));
-            if (isDisposed) return;
-            await Promise.all(
-              otherProjects.map((project) =>
-                invoke('watch_repo', { repoPath: project.path }).catch(console.error),
-              ),
-            );
+            for (const project of otherProjects) {
+              if (isDisposed) return;
+              const record = await invoke<ProjectSnapshotRecord | null>('load_project_snapshot', {
+                projectId: project.path,
+              }).catch(() => null);
+              const snapshot = toRepoVisualSnapshot(record);
+              if (snapshot?.loaded) {
+                upsertProjectSnapshot(normalizePath(project.path), snapshot);
+                seedProjectSnapshotFromRecord(normalizePath(project.path), snapshot);
+              }
+              await yieldToPaint();
+            }
           })();
         }
       } catch (error) {
@@ -1828,6 +1881,77 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
       await invoke('reveal_in_finder', { path: normalizedPath });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function copyProjectDiagnostics(path: string) {
+    const normalizedPath = normalizePath(path);
+    if (!normalizedPath) return;
+    const isActive = sameRepoPath(repoPath, normalizedPath);
+    const snapshot = isActive
+      ? (() => {
+          try {
+            return buildActiveRepoSnapshot(normalizedPath);
+          } catch {
+            return projectSnapshots[normalizedPath] ?? null;
+          }
+        })()
+      : projectSnapshots[normalizedPath] ?? null;
+    const project = projects.find((candidate) => sameRepoPath(candidate.path, normalizedPath));
+    const memory = (performance as Performance & {
+      memory?: { usedJSHeapSize: number; totalJSHeapSize: number; jsHeapSizeLimit: number };
+    }).memory;
+    const appVersion = await getVersion().catch(() => 'unknown');
+    const diagnostics = {
+      generatedAt: new Date().toISOString(),
+      app: {
+        version: appVersion,
+        userAgent: navigator.userAgent,
+      },
+      project: {
+        name: project?.name ?? snapshot?.name ?? basenameFromPath(normalizedPath),
+        path: normalizedPath,
+        active: isActive,
+        loaded: snapshot?.loaded ?? false,
+        snapshotUpdatedAtMs: snapshot?.updatedAtMs ?? null,
+        cacheSchemaVersion: snapshot?.cacheSchemaVersion ?? null,
+      },
+      counts: {
+        branches: snapshot?.branches.length ?? 0,
+        commits: snapshot?.directCommits.length ?? 0,
+        unpushedCommits: snapshot?.unpushedDirectCommits.length ?? 0,
+        mergeNodes: snapshot?.mergeNodes.length ?? 0,
+        worktrees: snapshot?.worktrees.length ?? 0,
+        dirtyWorktrees: snapshot?.worktrees.filter((worktree) => worktree.hasUncommittedChanges).length ?? 0,
+        stashes: snapshot?.stashes.length ?? 0,
+      },
+      loading: projectLoadStates[projectLoadKey(normalizedPath)] ?? null,
+      map: isActive ? {
+        presentationState: mapPresentationState,
+        loading: mapLoading,
+        readyForDisplay: mapReadyForDisplay,
+        switchEpoch: mapSwitchEpochRef.current,
+        layout: mapLayoutStatus,
+        renderedNodes: gridLayoutModelForView.renderNodes.length,
+        allCommits: gridLayoutModelForView.allCommits.length,
+        connectors: gridLayoutModelForView.connectors.length,
+        mergeConnectors: gridLayoutModelForView.mergeConnectors.length,
+      } : null,
+      memory: memory ? {
+        usedJSHeapBytes: memory.usedJSHeapSize,
+        totalJSHeapBytes: memory.totalJSHeapSize,
+        heapLimitBytes: memory.jsHeapSizeLimit,
+      } : null,
+      recentMapEvents: isActive ? softUpdateDebugEvents.slice(-25) : [],
+      currentError: isActive ? error : null,
+    };
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
+      setDiagnosticsCopyFeedback('Diagnostics copied');
+      window.setTimeout(() => setDiagnosticsCopyFeedback(null), 1800);
+    } catch (copyError) {
+      console.error('Failed to copy diagnostics:', copyError);
+      setDiagnosticsCopyFeedback('Copy failed');
     }
   }
 
@@ -2837,10 +2961,15 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     if (!options?.allowSamePathInFlight && sameRepoPath(loadRepoInFlightPathRef.current, normalizedPath)) return;
     loadRepoInFlightPathRef.current = normalizedPath;
     const requestId = ++loadRepoRequestIdRef.current;
+    const loadKey = projectLoadKey(normalizedPath);
+    setProjectLoadStates((previous) => ({
+      ...previous,
+      [loadKey]: { status: 'loading', phase: 'Loading snapshot', progress: 1 },
+    }));
 
     const previousPath = repoPath ? normalizePath(repoPath) : null;
+    const keepCurrentRepoVisible = Boolean(previousPath && !sameRepoPath(previousPath, normalizedPath));
     if (previousPath && !sameRepoPath(previousPath, normalizedPath)) {
-      activeSnapshotSignatureRef.current = null;
       clearPostCommitProtectionForPath(normalizedPath);
       try {
         upsertProjectSnapshot(previousPath, buildActiveRepoSnapshot(previousPath), { force: true });
@@ -2849,27 +2978,26 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       }
     }
 
-    const switchEpoch = beginMapSwitch();
+    let switchEpoch: number | null = null;
+    const ensureMapSwitchStarted = () => {
+      if (switchEpoch != null) return switchEpoch;
+      activeSnapshotSignatureRef.current = null;
+      switchEpoch = beginMapSwitch();
+      setHydratedLayoutModel(null);
+      setHydratedLayoutKey(null);
+      isRepoSwitchingRef.current = true;
+      setMapLoading(true);
+      return switchEpoch;
+    };
     let hasError = false;
     if (repoPath && sharedGridLayoutCacheKey) {
       layoutModelCacheRef.current.set(sharedGridLayoutCacheKey, sharedGridLayoutModel);
-    }    setHydratedLayoutModel(null);
-    setHydratedLayoutKey(null);
-    isRepoSwitchingRef.current = true;
-    setMapLoading(true);
-    setLoading(true);
+    }
+    if (!keepCurrentRepoVisible) {
+      ensureMapSwitchStarted();
+    }
+    setLoading(!keepCurrentRepoVisible);
     setError(null);
-    const switchFallbackId = window.setTimeout(() => {
-      if (requestId !== loadRepoRequestIdRef.current) return;
-      setMapReadyForDisplay(true);
-      setMapLoading(false);
-      setLoading(false);
-      isRepoSwitchingRef.current = false;
-      setMapPresentationState('ready');
-      if (sameRepoPath(loadRepoInFlightPathRef.current, normalizedPath)) {
-        loadRepoInFlightPathRef.current = null;
-      }
-    }, 2500);
     await yieldToPaint();
     if (requestId !== loadRepoRequestIdRef.current) {
       if (sameRepoPath(loadRepoInFlightPathRef.current, normalizedPath)) loadRepoInFlightPathRef.current = null;
@@ -2877,16 +3005,40 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     }
 
     let cachedSnapshot: RepoVisualSnapshot | null = null;
+    let snapshotResolveError: unknown = null;
     try {
       cachedSnapshot = await resolveSnapshotForProjectSwitch(normalizedPath);
-    } catch {
-      cachedSnapshot = projectSnapshots[normalizedPath]
-        ?? await loadProjectSnapshot(normalizedPath);
+    } catch (loadError) {
+      snapshotResolveError = loadError;
+      cachedSnapshot = projectSnapshots[normalizedPath] ?? null;
+    }
+    if (requestId !== loadRepoRequestIdRef.current) {
+      return;
+    }
+    if (!cachedSnapshot?.loaded && snapshotResolveError) {
+      const message = snapshotResolveError instanceof Error ? snapshotResolveError.message : String(snapshotResolveError);
+      setError(message);
+      setLoading(false);
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [loadKey]: {
+          status: 'error',
+          phase: 'Load failed',
+          progress: 100,
+          error: message,
+        },
+      }));
+      if (!keepCurrentRepoVisible && switchEpoch != null) finishMapSwitch(switchEpoch, 'error');
+      if (sameRepoPath(loadRepoInFlightPathRef.current, normalizedPath)) loadRepoInFlightPathRef.current = null;
+      return;
     }
     if (cachedSnapshot?.loaded) {
       try {
         await loadNodePositionsForRepo(normalizedPath);
-        if (requestId !== loadRepoRequestIdRef.current) return;
+        if (requestId !== loadRepoRequestIdRef.current) {
+          return;
+        }
+        ensureMapSwitchStarted();
         const applied = applySnapshotToActiveState(normalizedPath, cachedSnapshot, {
           force: true,
           allowIncomingDirty: true,
@@ -2905,9 +3057,14 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
         });
         await yieldToPaint();
         await yieldToPaint();
-        if (requestId !== loadRepoRequestIdRef.current) return;
-        finishMapSwitch(switchEpoch, 'ready');
+        if (requestId !== loadRepoRequestIdRef.current) {
+          return;
+        }
         setLoading(false);
+        setProjectLoadStates((previous) => ({
+          ...previous,
+          [loadKey]: { status: 'loading', phase: 'Building map', progress: 95 },
+        }));
         void fetchGitHubData(normalizedPath);
         void (async () => {
           if (requestId !== loadRepoRequestIdRef.current) return;
@@ -2926,11 +3083,19 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       } catch (e) {
         console.error('Failed to load cached repo snapshot:', e);
         setError(e instanceof Error ? e.message : String(e));
-        setRepoPath(null);
+        if (!keepCurrentRepoVisible) setRepoPath(null);
         setLoading(false);
-        finishMapSwitch(switchEpoch, 'error');
+        setProjectLoadStates((previous) => ({
+          ...previous,
+          [loadKey]: {
+            status: 'error',
+            phase: 'Load failed',
+            progress: 100,
+            error: e instanceof Error ? e.message : String(e),
+          },
+        }));
+        if (switchEpoch != null) finishMapSwitch(switchEpoch, 'error');
       } finally {
-        window.clearTimeout(switchFallbackId);
         if (sameRepoPath(loadRepoInFlightPathRef.current, normalizedPath)) loadRepoInFlightPathRef.current = null;
       }
       return;
@@ -2938,7 +3103,9 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
 
     // Yield to the browser paint cycle so the map shell and loader are painted
     await new Promise((resolve) => setTimeout(resolve, 15));
-    if (requestId !== loadRepoRequestIdRef.current) return;
+    if (requestId !== loadRepoRequestIdRef.current) {
+      return;
+    }
 
     try {
       // Phase 1: fast metadata — show the map shell immediately
@@ -2946,10 +3113,9 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
         invoke<{ name: string; path: string }>('get_repo_info', { repoPath: normalizedPath }),
         invoke<string>('get_default_branch', { repoPath: normalizedPath }),
       ]);
-      if (requestId !== loadRepoRequestIdRef.current) return;
-      setRepoName(info.name);
-      setDefaultBranch(def);
-
+      if (requestId !== loadRepoRequestIdRef.current) {
+        return;
+      }
       const record = await invoke<ProjectSnapshotRecord>('add_project_and_ingest', {
         repoPath: normalizedPath,
       });
@@ -2957,9 +3123,16 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       if (!snapshot) {
         throw new Error('Missing repo visual snapshot payload');
       }
-      if (requestId !== loadRepoRequestIdRef.current) return;
+      if (requestId !== loadRepoRequestIdRef.current) {
+        return;
+      }
       await loadNodePositionsForRepo(normalizedPath);
-      if (requestId !== loadRepoRequestIdRef.current) return;
+      if (requestId !== loadRepoRequestIdRef.current) {
+        return;
+      }
+      ensureMapSwitchStarted();
+      setRepoName(info.name);
+      setDefaultBranch(def);
       upsertProjectSnapshot(normalizedPath, snapshot);
       projectQuickStateRef.current = {
         ...projectQuickStateRef.current,
@@ -2988,9 +3161,14 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       });
       await yieldToPaint();
       await yieldToPaint();
-      if (requestId !== loadRepoRequestIdRef.current) return;
-      finishMapSwitch(switchEpoch, 'ready');
+      if (requestId !== loadRepoRequestIdRef.current) {
+        return;
+      }
       setLoading(false); // unblock the landing button
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [loadKey]: { status: 'loading', phase: 'Building map', progress: 95 },
+      }));
 
       // Phase 3: GitHub data (non-blocking)
       void fetchGitHubData(normalizedPath);
@@ -2999,13 +3177,21 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       if (requestId !== loadRepoRequestIdRef.current) return;
       console.error('Failed to load repo:', e);
       setError(e instanceof Error ? e.message : String(e));
-      setRepoPath(null);
+      if (!keepCurrentRepoVisible) setRepoPath(null);
       setLoading(false);
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [loadKey]: {
+          status: 'error',
+          phase: 'Load failed',
+          progress: 100,
+          error: e instanceof Error ? e.message : String(e),
+        },
+      }));
     } finally {
-      window.clearTimeout(switchFallbackId);
       if (sameRepoPath(loadRepoInFlightPathRef.current, normalizedPath)) loadRepoInFlightPathRef.current = null;
       if (requestId !== loadRepoRequestIdRef.current) return;
-      finishMapSwitch(switchEpoch, hasError ? 'error' : 'ready');
+      if (hasError && switchEpoch != null) finishMapSwitch(switchEpoch, 'error');
     }
   }
 
@@ -3422,6 +3608,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
 
     return () => {
       isDisposed = true;
+      void invoke('unwatch_repo', { repoPath }).catch(() => undefined);
       runRepoRefreshRef.current = null;
       scheduleDeferredRepoRefreshRef.current = null;
       repoSyncScheduler?.dispose();
@@ -3499,16 +3686,19 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     const nextCommitPreviews: Record<string, BranchCommitPreview[]> = {};
     const nextUniqueAheadCounts: Record<string, number> = {};
     const directOwnerBySha = new Map<string, string>();
+    const directCommitsByBranch = new Map<string, DirectCommit[]>();
     for (const commit of directCommits) {
       directOwnerBySha.set(commit.fullSha, commit.branch);
       directOwnerBySha.set(commit.sha, commit.branch);
+      const branchCommits = directCommitsByBranch.get(commit.branch) ?? [];
+      branchCommits.push(commit);
+      directCommitsByBranch.set(commit.branch, branchCommits);
     }
     const previewOwner = (preview: BranchCommitPreview): string | null =>
       directOwnerBySha.get(preview.fullSha) ?? directOwnerBySha.get(preview.sha) ?? null;
     for (const branch of branches) {
       if (branch.name === defaultBranch) continue;
-      const previewsFromDirect = directCommits
-        .filter((commit) => commit.branch === branch.name)
+      const previewsFromDirect = (directCommitsByBranch.get(branch.name) ?? [])
         .map((commit) => ({
           fullSha: commit.fullSha,
           sha: commit.sha,
@@ -3519,13 +3709,14 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
           kind: 'commit' as const,
           isRemote: commit.isRemote ?? false,
         }));
+      const directPreviewShas = new Set(previewsFromDirect.map((preview) => preview.fullSha));
       const preservedPreviews = (latestBranchCommitPreviewsRef.current[branch.name] ?? []).filter(
         (preview) => {
           const owner = previewOwner(preview);
           return preview.kind !== 'branch-created'
             && (owner == null || owner === branch.name)
             && (preview.isRemote || branch.remoteSyncStatus === 'on-github')
-            && !previewsFromDirect.some((candidate) => candidate.fullSha === preview.fullSha);
+            && !directPreviewShas.has(preview.fullSha);
         },
       );
       const mergedPreviews = [...previewsFromDirect, ...preservedPreviews];
@@ -3535,9 +3726,11 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
 
     const commitBranchesBySha = new Map<string, Set<string>>();
     for (const commit of directCommits) {
-      const known = commitBranchesBySha.get(commit.fullSha) ?? new Set<string>();
-      known.add(commit.branch);
-      commitBranchesBySha.set(commit.fullSha, known);
+      for (const sha of [commit.fullSha, commit.sha]) {
+        const known = commitBranchesBySha.get(sha) ?? new Set<string>();
+        known.add(commit.branch);
+        commitBranchesBySha.set(sha, known);
+      }
     }
     const knownBranchNames = new Set(branches.map((branch) => branch.name));
     const isValidParentBranch = (candidate: string | null | undefined, selfName: string): candidate is string => {
@@ -3594,6 +3787,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     };
     const nextBranchParentByName: Record<string, string | null> = { [defaultBranch]: null };
     const nextBranchHeadByName: Record<string, string> = {};
+    const branchesByName = new Map(branches.map((item) => [item.name, item] as const));
     for (const branch of branches) {
       nextBranchHeadByName[branch.name] = branch.headSha;
       if (branch.name === defaultBranch) {
@@ -3610,7 +3804,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
         nextBranchParentByName[branch.name] = previousParent;
         continue;
       }
-      const branchCommits = directCommits.filter((commit) => commit.branch === branch.name);
+      const branchCommits = directCommitsByBranch.get(branch.name) ?? [];
       const branchCommitShas = new Set(branchCommits.map((commit) => commit.fullSha));
       const graphParentSha = branchCommits
         .filter((commit) => {
@@ -3632,7 +3826,6 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       const parentFromLatest = isValidParentBranch(latestBranchParentByNameRef.current[branch.name] ?? null, branch.name)
         ? latestBranchParentByNameRef.current[branch.name]!
         : null;
-      const branchesByName = new Map(branches.map((item) => [item.name, item] as const));
       let resolvedParent =
         parentFromBranchMeta ??
         parentFromForkSha ??
@@ -5306,6 +5499,34 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     }),
     [layoutRevisionForView],
   );
+  const handleBranchGridLayoutStatus = useCallback((status: BranchGridLayoutStatus) => {
+    setMapLayoutStatus(status);
+    const activePath = currentRepoPathRef.current;
+    if (!activePath) return;
+    const key = projectLoadKey(activePath);
+    if (status.state === 'computing' && isRepoSwitchingRef.current) {
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [key]: { status: 'loading', phase: 'Building map', progress: 95 },
+      }));
+      return;
+    }
+    if (status.state === 'error') {
+      setMapLoading(false);
+      setMapReadyForDisplay(false);
+      setMapPresentationState('error');
+      isRepoSwitchingRef.current = false;
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [key]: {
+          status: 'error',
+          phase: 'Map failed',
+          progress: 100,
+          error: status.error,
+        },
+      }));
+    }
+  }, []);
   const sharedGridLayoutModel = useBranchGridLayoutFromRevision({
     layoutRevisionForView: layoutGridRevision,
     sharedGridLayoutCacheKey,
@@ -5313,6 +5534,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     hydratedLayoutKey,
     mapLoading,
     layoutModelCacheRef,
+    onStatusChange: handleBranchGridLayoutStatus,
   });
   const gridLayoutModelForView = sharedGridLayoutModel;
   useEffect(() => {
@@ -5320,6 +5542,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
   }, [gridLayoutModelForView]);
 
   const softUpdateDebugRows = useMemo(() => {
+    if (!isGridDebugOpen) return [];
     const normalizedRepoPath = repoPath ? normalizePath(repoPath) : '';
     const overrides = normalizedRepoPath ? (nodePositionOverridesByRepo[normalizedRepoPath] ?? {}) : {};
     const overrideKeys = Object.keys(overrides);
@@ -5356,6 +5579,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     enrichedBranchCommitPreviews,
     graphLayoutSignature,
     gridLayoutModelForView,
+    isGridDebugOpen,
     nodePositionOverridesByRepo,
     repoPath,
     softUpdateDebugEvents,
@@ -5527,7 +5751,14 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
 
   const handleMapReadyForDisplay = useCallback((epoch: number) => {
     if (epoch !== mapSwitchEpochRef.current) return;
-    setMapReadyForDisplay(true);
+    finishMapSwitch(epoch, 'ready');
+    const activePath = currentRepoPathRef.current;
+    if (!activePath) return;
+    const key = projectLoadKey(activePath);
+    setProjectLoadStates((previous) => ({
+      ...previous,
+      [key]: { status: 'ready', phase: 'Ready', progress: 100 },
+    }));
   }, []);
 
   const runPreviewForTarget = useCallback(async (
@@ -5997,7 +6228,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
   }, []);
 
   const blockMapDisplay = !mapReadyForDisplay || mapPresentationState !== 'ready';
-  const blockMapInteraction = mapLoading || loading;
+  const blockMapInteraction = mapLoading;
 
   const handleCreateWorktree = useCallback((projectPath: string, branchOrCommitInput?: string) => {
     setWorktreePromptProjectPath(projectPath);
@@ -6386,7 +6617,8 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
               onReorderProjects={reorderProjects}
               onRevealProjectInFinder={revealProjectInFinder}
               onResetProjectNodePositions={resetProjectNodePositions}
-              projectLoading={loading || (projectTreeLoading && repoPath ? !projectSnapshots[repoPath]?.loaded : false)}
+              projectLoading={!repoPath && loading}
+              projectLoadStates={projectLoadStates}
               projectError={error}
               terminalSessions={terminalSessions}
               activeTerminalId={activeTerminalId}
@@ -6464,7 +6696,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
                 gridSearchJumpToken={gridSearchJumpToken}
                 gridSearchJumpDirection={gridSearchJumpDirection}
                 gridFocusSha={gridFocusSha}
-                isLoading={mapLoading || loading}
+                isLoading={mapLoading}
                 isSyncing={projectTreeLoading}
                 blockMapDisplay={blockMapDisplay}
                 blockMapInteraction={blockMapInteraction}
@@ -6527,6 +6759,63 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
                 gridHudProps={gridHudProps}
                 onShowContextMenu={showContextMenu}
               />
+              {mapLoading && mapLayoutStatus.state === 'computing' ? (
+                <div className="pointer-events-none absolute inset-x-0 bottom-5 z-[130] flex justify-center px-4">
+                  <div className="pointer-events-auto flex items-center gap-3 rounded-xl border border-border bg-card/80 px-3 py-2 text-xs text-muted-foreground shadow-sm backdrop-blur-sm">
+                    <span>Building map for {mapLayoutStatus.nodeEstimate.toLocaleString()} items</span>
+                    {repoPath ? (
+                      <button
+                        type="button"
+                        onClick={() => void copyProjectDiagnostics(repoPath)}
+                        className="rounded-lg px-2 py-1 text-foreground transition-colors hover:bg-muted"
+                      >
+                        Copy diagnostics
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+              {mapPresentationState === 'error' && repoPath ? (
+                <div className="absolute inset-0 z-[140] flex items-center justify-center bg-background/80 p-6 backdrop-blur-sm">
+                  <div className="w-full max-w-md rounded-2xl border border-border bg-card p-4 shadow-lg">
+                    <p className="text-sm font-medium text-foreground">Map could not be built</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {mapLayoutStatus.error ?? 'The repository data is available. The map worker stopped before it produced a layout.'}
+                    </p>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      {mapLayoutStatus.nodeEstimate.toLocaleString()} items were sent to the map worker.
+                    </p>
+                    <div className="mt-4 flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void copyProjectDiagnostics(repoPath)}
+                        className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+                      >
+                        Copy diagnostics
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          beginMapSwitch();
+                          isRepoSwitchingRef.current = true;
+                          setMapLoading(true);
+                          setLayoutEpoch((epoch) => epoch + 1);
+                        }}
+                        className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+                      >
+                        Retry map
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+              {diagnosticsCopyFeedback ? (
+                <div className="pointer-events-none absolute inset-x-0 bottom-5 z-[160] flex justify-center">
+                  <span className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs text-foreground shadow-sm">
+                    {diagnosticsCopyFeedback}
+                  </span>
+                </div>
+              ) : null}
               {previewSetupOpen && previewDraftConfig ? (
                 <div className="absolute inset-0 z-[90] flex items-center justify-center bg-background/70 p-4 backdrop-blur-sm">
                   <div className="w-full max-w-md rounded-2xl border border-border bg-background p-4 shadow-lg">
@@ -6645,6 +6934,16 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
                 className="w-full px-2 py-1.5 text-left text-xs transition-colors hover:bg-muted"
               >
                 New worktree
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setContextMenu(null);
+                  void copyProjectDiagnostics(contextMenu.projectPath);
+                }}
+                className="w-full px-2 py-1.5 text-left text-xs transition-colors hover:bg-muted"
+              >
+                Copy diagnostics
               </button>
               <button
                 type="button"

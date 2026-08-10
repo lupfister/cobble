@@ -35,6 +35,23 @@ fn worktree_paths_are_same(repo: &Path, wt_path: &Path) -> bool {
 /// List all worktrees for the repository that contains `repo`.
 /// `repo` may be the main checkout or any linked worktree path.
 pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeInfo>, GitError> {
+    list_worktrees_impl(repo, true)
+}
+
+/// List worktree roots without running status and parent probes in every checkout.
+/// This is used by file watcher setup, where only the paths are needed.
+pub fn list_worktree_paths(repo: &Path) -> Result<Vec<String>, GitError> {
+    Ok(list_worktrees_impl(repo, false)?
+        .into_iter()
+        .filter(|worktree| worktree.path_exists)
+        .map(|worktree| worktree.path)
+        .collect())
+}
+
+fn list_worktrees_impl(
+    repo: &Path,
+    inspect_checkout_state: bool,
+) -> Result<Vec<WorktreeInfo>, GitError> {
     let output = cli::run(repo, &["worktree", "list", "--porcelain"])?;
     let mut parsed: Vec<PartialWt> = Vec::new();
     let mut current: Option<PartialWt> = None;
@@ -90,14 +107,14 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeInfo>, GitError> {
 
         let wt_path = Path::new(&partial.path);
         let path_exists = wt_path.exists();
-        let parent_sha = if path_exists {
+        let parent_sha = if path_exists && inspect_checkout_state {
             git_parent_sha(wt_path).ok().flatten()
         } else {
             None
         };
 
         let is_current = worktree_paths_are_same(repo, wt_path);
-        let has_uncommitted_changes = if path_exists {
+        let has_uncommitted_changes = if path_exists && inspect_checkout_state {
             worktree_has_uncommitted_changes(wt_path)
         } else {
             false

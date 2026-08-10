@@ -26,4 +26,6 @@ pub use stash::{
     apply_stash_restore, create_branch_from_uncommitted, create_root_branch, list_stashes,
     move_stash_to_new_branch, stash_drop, stash_push, GitStashEntry,
 };
-pub use worktrees::{list_worktrees, remove_worktree as remove_git_worktree, WorktreeInfo};
+pub use worktrees::{
+    list_worktree_paths, list_worktrees, remove_worktree as remove_git_worktree, WorktreeInfo,
+};
