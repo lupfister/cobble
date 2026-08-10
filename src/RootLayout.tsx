@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { Agentation } from 'agentation';
 import { DialRoot, useDialKit } from 'dialkit';
 import 'dialkit/styles.css';
+import BugReportDialog from './BugReportDialog';
 import { useAutoUpdater } from './useAutoUpdater';
 
 type RootLayoutProps = {
@@ -46,6 +47,7 @@ const RootLayout = ({ children }: RootLayoutProps) => {
   return (
     <>
       {children}
+      <BugReportDialog />
       <DialKitBootstrap />
       {!uiHidden && (
         <>

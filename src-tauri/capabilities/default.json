@@ -12,6 +12,14 @@
     "core:window:allow-toggle-maximize",
     "dialog:allow-open",
     "dialog:allow-message",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://github.com/lupfister/cobble/issues/new*"
+        }
+      ]
+    },
     "process:allow-restart",
     "updater:default",
     "window-state:default"

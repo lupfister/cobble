@@ -9190,11 +9190,18 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_menu_event(|app, event| {
-            if event.id().as_ref() == "check_for_updates" {
-                let _ = app.emit("cobble://check-for-updates", ());
+            match event.id().as_ref() {
+                "check_for_updates" => {
+                    let _ = app.emit("cobble://check-for-updates", ());
+                }
+                "report_bug" => {
+                    let _ = app.emit("cobble://report-bug", ());
+                }
+                _ => {}
             }
         });
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -9223,6 +9230,14 @@ pub fn run() {
                         None::<&str>,
                     )?;
                     app_menu.insert(&check_for_updates, 1)?;
+                    let report_bug = tauri::menu::MenuItem::with_id(
+                        app,
+                        "report_bug",
+                        "Report a Bug…",
+                        true,
+                        None::<&str>,
+                    )?;
+                    app_menu.insert(&report_bug, 2)?;
                 }
             }
             #[cfg(target_os = "macos")]
