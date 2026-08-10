@@ -9193,16 +9193,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .on_menu_event(|app, event| {
-            match event.id().as_ref() {
-                "check_for_updates" => {
-                    let _ = app.emit("cobble://check-for-updates", ());
-                }
-                "report_bug" => {
-                    let _ = app.emit("cobble://report-bug", ());
-                }
-                _ => {}
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "check_for_updates" => {
+                let _ = app.emit("cobble://check-for-updates", ());
             }
+            "report_bug" => {
+                let _ = app.emit("cobble://report-bug", ());
+            }
+            _ => {}
         });
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
