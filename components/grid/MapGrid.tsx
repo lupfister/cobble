@@ -146,7 +146,7 @@ const serializeDebugConnector = (connector: Connector, nodeByVisualId: Map<strin
 };
 
 function MapGridLoadingState() {
-  return <MapGridLoadingTiles />;
+  return <MapGridLoadingTiles shimmer={false} />;
 }
 
 function MapGridBlockingOverlay() {

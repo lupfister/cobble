@@ -37,11 +37,48 @@ import { computeMergeConnectorAnchors, computeParentChildConnectorAnchors } from
 import { getMapGridConnectorPolyline } from './gridPathUtils';
 import { deriveAllClumpsFromOwners, syncClumpCoordinatesToRenderNodes } from './clumpLayout';
 import { getNodePositionOverride, migrateNodePositionOverridesForCommits } from './nodePositionOverrides';
-import { resolveOverrideAwareNodeCollisions } from './overrideLayoutPropagation';
 import { applyNodePositionOverrides } from './applyNodePositionOverrides';
 
 /** Sync with MapGrid GRID_RENDER_ZOOM — row pitch is authored in this render space. */
 export const GRID_LAYOUT_RENDER_ZOOM = 2.25;
+
+const ROW_SPAN_BUCKET_SIZE = 32;
+
+type RowSpanEntry<T> = {
+  value: T;
+  minRow: number;
+  maxRow: number;
+};
+
+type RowSpanIndex<T> = Map<number, RowSpanEntry<T>[]>;
+
+const buildRowSpanIndex = <T,>(
+  values: T[],
+  rows: (value: T) => { from: number; to: number },
+): RowSpanIndex<T> => {
+  const index: RowSpanIndex<T> = new Map();
+  for (const value of values) {
+    const span = rows(value);
+    const minRow = Math.min(span.from, span.to);
+    const maxRow = Math.max(span.from, span.to);
+    const firstBucket = Math.floor(minRow / ROW_SPAN_BUCKET_SIZE);
+    const lastBucket = Math.floor(maxRow / ROW_SPAN_BUCKET_SIZE);
+    const entry = { value, minRow, maxRow };
+    for (let bucket = firstBucket; bucket <= lastBucket; bucket += 1) {
+      const entries = index.get(bucket) ?? [];
+      entries.push(entry);
+      index.set(bucket, entries);
+    }
+  }
+  return index;
+};
+
+const queryRowSpanIndex = <T,>(index: RowSpanIndex<T>, row: number): T[] => {
+  const bucket = Math.floor(row / ROW_SPAN_BUCKET_SIZE);
+  return (index.get(bucket) ?? [])
+    .filter((entry) => entry.minRow <= row && entry.maxRow >= row)
+    .map((entry) => entry.value);
+};
 
 export type GridCluster = {
   branchName: string;
@@ -307,72 +344,6 @@ const compactVisibleLaneColumns = (
     }
     node.x = LEFT_PADDING + compactColumn * COLUMN_WIDTH;
   }
-};
-
-const reservedClumpColumns = (
-  clumpOwnerColumnByClusterKey: Map<string, number>,
-  clusterCounts: Map<string, number>,
-): Set<number> => {
-  const columns = new Set<number>();
-  for (const [clusterKey, count] of clusterCounts.entries()) {
-    if (count <= 1) continue;
-    const ownerColumn = clumpOwnerColumnByClusterKey.get(clusterKey);
-    if (ownerColumn == null) continue;
-    for (let offset = 0; offset < count; offset += 1) {
-      columns.add(ownerColumn + offset);
-    }
-  }
-  return columns;
-};
-
-const resolveVisibleNodeColumnCollisions = (
-  nodes: Node[],
-  columnByCommitVisualId: Map<string, number>,
-  isHorizontal: boolean,
-  zoomAwareLanePitch: number,
-  clusterKeyByCommitId?: Map<string, string>,
-  clusterCounts?: Map<string, number>,
-): Set<string> => {
-  const changedVisualIds = new Set<string>();
-  const occupiedByRow = new Map<number, Map<number, string | null>>();
-  const orderedNodes = [...nodes].sort((a, b) => {
-    if (a.row !== b.row) return a.row - b.row;
-    if (a.column !== b.column) return a.column - b.column;
-    return a.commit.visualId.localeCompare(b.commit.visualId);
-  });
-
-  for (const node of orderedNodes) {
-    const clusterKey = clusterKeyByCommitId?.get(node.commit.visualId) ?? null;
-    const collisionKey =
-      clusterKey && (clusterCounts?.get(clusterKey) ?? 1) > 1 ? clusterKey : null;
-    const columnCollides = (column: number): boolean => {
-      for (let row = node.row - 1; row <= node.row + 1; row += 1) {
-        const occupant = occupiedByRow.get(row)?.get(column);
-        if (occupant !== undefined && (collisionKey === null || occupant !== collisionKey)) {
-          return true;
-        }
-      }
-      return false;
-    };
-    let column = node.column;
-    while (columnCollides(column)) {
-      column += 1;
-    }
-    const occupiedColumns = occupiedByRow.get(node.row) ?? new Map<number, string | null>();
-    occupiedColumns.set(column, collisionKey);
-    occupiedByRow.set(node.row, occupiedColumns);
-    if (column === node.column) continue;
-
-    changedVisualIds.add(node.commit.visualId);
-    node.column = column;
-    columnByCommitVisualId.set(node.commit.visualId, column);
-    if (isHorizontal) {
-      node.y = TOP_PADDING + column * zoomAwareLanePitch;
-    } else {
-      node.x = LEFT_PADDING + column * COLUMN_WIDTH;
-    }
-  }
-  return changedVisualIds;
 };
 
 const syncClumpOwnerColumnsFromLeadNodes = (
@@ -925,6 +896,8 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
   const boundaryShaByCommitId = new Set<string>();
   const findCommitBySha = (sha: string | null | undefined): VisualCommit | null => {
     if (!sha) return null;
+    const exact = commitById.get(sha);
+    if (exact) return exact;
     const resolved = allCommits.find(
       (commit) => shasMatch(commit.id, sha) || shasMatch(commit.visualId.split(':').slice(1).join(':'), sha),
     );
@@ -1183,13 +1156,28 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
   const parentsMap = new Map<string, VisualCommit[]>();
   const childrenMap = new Map<string, VisualCommit[]>();
 
+  const commitsByExactSha = new Map<string, VisualCommit[]>();
+  const commitByBranchAndExactSha = new Map<string, VisualCommit>();
+  const commitByVisualId = new Map<string, VisualCommit>();
+  for (const commit of allCommitsWithClusters) {
+    const exactMatches = commitsByExactSha.get(commit.id) ?? [];
+    exactMatches.push(commit);
+    commitsByExactSha.set(commit.id, exactMatches);
+    commitByBranchAndExactSha.set(`${commit.branchName}\0${commit.id}`, commit);
+    commitByVisualId.set(commit.visualId, commit);
+  }
+
   const findCommitNode = (sha: string, preferredBranchName?: string): VisualCommit | null => {
     if (preferredBranchName) {
+      const exact = commitByBranchAndExactSha.get(`${preferredBranchName}\0${sha}`);
+      if (exact) return exact;
       const match = allCommitsWithClusters.find(
         (c) => c.branchName === preferredBranchName && (shasMatch(c.id, sha) || shasMatch(c.visualId, sha))
       );
       if (match) return match;
     }
+    const exact = commitsByExactSha.get(sha)?.[0];
+    if (exact) return exact;
     return allCommitsWithClusters.find((c) => shasMatch(c.id, sha) || shasMatch(c.visualId, sha)) || null;
   };
 
@@ -1227,7 +1215,7 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
     let preferredBranch: string | undefined = commit.branchName;
     if (clusterKey && count > 1) {
       const firstVisualId = firstByClusterKey.get(clusterKey);
-      const firstCommit = firstVisualId ? allCommitsWithClusters.find(c => c.visualId === firstVisualId) : null;
+      const firstCommit = firstVisualId ? commitByVisualId.get(firstVisualId) ?? null : null;
       parentSha = firstCommit?.parentSha ?? null;
       preferredBranch = firstCommit?.branchName;
     } else {
@@ -1429,11 +1417,10 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
       mergeClumpKeys.add(clusterKey);
     }
   }
-
   const firstClumpMember = (clusterKey: string): VisualCommit | null => {
     const firstVisualId = firstByClusterKey.get(clusterKey);
     return (
-      (firstVisualId ? allCommitsWithClusters.find((commit) => commit.visualId === firstVisualId) : null)
+      (firstVisualId ? commitByVisualId.get(firstVisualId) ?? null : null)
       ?? clumpMembersByKey.get(clusterKey)?.[0]
       ?? null
     );
@@ -1808,15 +1795,17 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
 
   let maxResolvedRow = compactRenderNodeTimelineRows(renderNodes);
   const renderNodeByVisualId = new Map(renderNodes.map((node) => [node.commit.visualId, node] as const));
+  const renderNodeByClusterKey = new Map<string, Node>();
+  for (const node of renderNodes) {
+    const clusterKey = clusterKeyByCommitId.get(node.commit.visualId);
+    if (clusterKey) renderNodeByClusterKey.set(clusterKey, node);
+  }
   const renderNodeForConstraintParent = (parent: VisualCommit): Node | null => {
-    const directNode = renderNodes.find((candidate) => candidate.commit.visualId === parent.visualId);
+    const directNode = renderNodeByVisualId.get(parent.visualId) ?? null;
     if (directNode) return directNode;
     const parentClusterKey = clusterKeyByCommitId.get(parent.visualId);
     if (!parentClusterKey || (clusterCounts.get(parentClusterKey) ?? 1) <= 1) return null;
-    return (
-      renderNodes.find((candidate) => clusterKeyByCommitId.get(candidate.commit.visualId) === parentClusterKey)
-      ?? null
-    );
+    return renderNodeByClusterKey.get(parentClusterKey) ?? null;
   };
   const renderConstraintParentsForNode = (node: Node): VisualCommit[] => {
     const nodeClusterKey = clusterKeyByCommitId.get(node.commit.visualId);
@@ -1837,116 +1826,110 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
     }
     return parentCandidates;
   };
+  const renderConstraintParentsByVisualId = new Map(
+    renderNodes.map((node) => [node.commit.visualId, renderConstraintParentsForNode(node)] as const),
+  );
 
-  // -------------------------------------------------------------
-  // Single Convergence Loop for Solver Invariants
-  // -------------------------------------------------------------
-  const exclusiveColumnKeyForNode = (node: Node): string | null => {
-    const clusterKey = clusterKeyByCommitId.get(node.commit.visualId);
-    if (clusterKey && mergeClumpKeys.has(clusterKey)) return `cluster:${clusterKey}`;
-    if (isGitMergeCommit(node.commit)) return `commit:${node.commit.visualId}`;
-    if (mergeSourceVisualIds.has(node.commit.visualId)) return `commit:${node.commit.visualId}`;
-    return null;
+  const renderConstraintParentNodesByVisualId = new Map<string, Node[]>();
+  const renderConstraintChildrenByVisualId = new Map<string, Node[]>();
+  for (const node of renderNodes) {
+    const parentNodes = (renderConstraintParentsByVisualId.get(node.commit.visualId) ?? [])
+      .map((parent) => renderNodeForConstraintParent(parent))
+      .filter((parent): parent is Node => !!parent && parent.commit.visualId !== node.commit.visualId);
+    renderConstraintParentNodesByVisualId.set(node.commit.visualId, parentNodes);
+    for (const parent of parentNodes) {
+      const children = renderConstraintChildrenByVisualId.get(parent.commit.visualId) ?? [];
+      if (!children.some((child) => child.commit.visualId === node.commit.visualId)) children.push(node);
+      renderConstraintChildrenByVisualId.set(parent.commit.visualId, children);
+    }
+  }
+
+  const visibleDependencyOrder = (): Node[] => {
+    const inDegree = new Map(
+      renderNodes.map((node) => [
+        node.commit.visualId,
+        renderConstraintParentNodesByVisualId.get(node.commit.visualId)?.length ?? 0,
+      ] as const),
+    );
+    const compareNodes = (left: Node, right: Node): number =>
+      left.row - right.row
+      || left.column - right.column
+      || left.commit.visualId.localeCompare(right.commit.visualId);
+    const queue = renderNodes.filter((node) => (inDegree.get(node.commit.visualId) ?? 0) === 0).sort(compareNodes);
+    const ordered: Node[] = [];
+    const seen = new Set<string>();
+    for (let index = 0; index < queue.length; index += 1) {
+      const node = queue[index]!;
+      if (seen.has(node.commit.visualId)) continue;
+      seen.add(node.commit.visualId);
+      ordered.push(node);
+      const children = [...(renderConstraintChildrenByVisualId.get(node.commit.visualId) ?? [])].sort(compareNodes);
+      for (const child of children) {
+        const nextDegree = (inDegree.get(child.commit.visualId) ?? 1) - 1;
+        inDegree.set(child.commit.visualId, nextDegree);
+        if (nextDegree === 0) queue.push(child);
+      }
+    }
+    ordered.push(...renderNodes.filter((node) => !seen.has(node.commit.visualId)).sort(compareNodes));
+    return ordered;
   };
-  const exclusiveRowKeyForNode = (node: Node): string | null => exclusiveColumnKeyForNode(node);
 
-  const enforceVisibleParentConstraints = (nodesList: Node[]): Set<string> => {
+  const placeVisibleNodesInDependencyOrder = (): Set<string> => {
     const changedIds = new Set<string>();
-    
-    // Rows: parentRow < childRow
-    for (const node of nodesList) {
-      const parentRows = renderConstraintParentsForNode(node)
-        .map((parent) => {
-          const parentNode = renderNodeForConstraintParent(parent);
-          return parentNode?.row ?? renderNodeByVisualId.get(parent.visualId)?.row ?? allRowByVisualId.get(parent.visualId) ?? -1;
-        })
-        .filter((row) => row >= 0);
-      if (parentRows.length > 0) {
-        const requiredRow = Math.max(...parentRows) + 1;
-        if (requiredRow > node.row) {
-          node.row = requiredRow;
-          changedIds.add(node.commit.visualId);
+    const occupiedByRow = new Map<number, Map<number, string | null>>();
+    const occupiedRowCounts = new Map<number, number>();
+    const occupiedColumnCounts = new Map<number, number>();
+    const exclusiveRows = new Set<number>();
+    const exclusiveColumns = new Set<number>();
+    const isExclusiveNode = (node: Node): boolean => {
+      const clusterKey = clusterKeyByCommitId.get(node.commit.visualId);
+      return (
+        (!!clusterKey && mergeClumpKeys.has(clusterKey))
+        || isGitMergeCommit(node.commit)
+        || mergeSourceVisualIds.has(node.commit.visualId)
+      );
+    };
+    for (const node of visibleDependencyOrder()) {
+      const parents = renderConstraintParentNodesByVisualId.get(node.commit.visualId) ?? [];
+      let row = parents.reduce((candidate, parent) => Math.max(candidate, parent.row + 1), node.row);
+      let column = parents.reduce((candidate, parent) => Math.max(candidate, parent.column + 1), node.column);
+      const exclusive = isExclusiveNode(node);
+      if (exclusive) {
+        while ((occupiedRowCounts.get(row) ?? 0) > 0 || exclusiveRows.has(row)) row += 1;
+        while ((occupiedColumnCounts.get(column) ?? 0) > 0 || exclusiveColumns.has(column)) column += 1;
+      } else {
+        while (exclusiveRows.has(row)) row += 1;
+        while (exclusiveColumns.has(column)) column += 1;
+      }
+      if (row !== node.row || column !== node.column) changedIds.add(node.commit.visualId);
+      node.row = row;
+      node.column = column;
+
+      const clusterKey = clusterKeyByCommitId.get(node.commit.visualId) ?? null;
+      const collisionKey = clusterKey && (clusterCounts.get(clusterKey) ?? 1) > 1 ? clusterKey : null;
+      const columnCollides = (candidateColumn: number): boolean => {
+        if (exclusiveColumns.has(candidateColumn)) return true;
+        if (exclusive && (occupiedColumnCounts.get(candidateColumn) ?? 0) > 0) return true;
+        for (let adjacentRow = node.row - 1; adjacentRow <= node.row + 1; adjacentRow += 1) {
+          const occupant = occupiedByRow.get(adjacentRow)?.get(candidateColumn);
+          if (occupant !== undefined && (collisionKey === null || occupant !== collisionKey)) return true;
         }
-      }
-    }
-
-    // Columns: parentColumn <= childColumn
-    for (const node of nodesList) {
-      const parentColumns = renderConstraintParentsForNode(node)
-        .map((parent) => {
-          const parentNode = renderNodeForConstraintParent(parent);
-          return parentNode?.column ?? columnByCommitVisualId.get(parent.visualId) ?? -1;
-        })
-        .filter((column) => column >= 0);
-      if (parentColumns.length > 0) {
-        const requiredColumn = Math.max(...parentColumns) + 1;
-        if (requiredColumn > node.column) {
-          node.column = requiredColumn;
-          columnByCommitVisualId.set(node.commit.visualId, requiredColumn);
-          changedIds.add(node.commit.visualId);
-        }
-      }
-    }
-    return changedIds;
-  };
-
-  const enforceExclusiveMergeRows = (nodesList: Node[]): Set<string> => {
-    const changedIds = new Set<string>();
-    const orderedNodes = [...nodesList].sort((a, b) => {
-      if (a.row !== b.row) return a.row - b.row;
-      if (a.column !== b.column) return a.column - b.column;
-      return a.commit.visualId.localeCompare(b.commit.visualId);
-    });
-
-    let conflictRow: number | null = null;
-    let ownerKey: string | null = null;
-    for (const node of orderedNodes) {
-      const key = exclusiveRowKeyForNode(node);
-      if (!key) continue;
-      const rowNodes = orderedNodes.filter((candidate) => candidate.row === node.row);
-      if (rowNodes.every((candidate) => exclusiveRowKeyForNode(candidate) === key)) continue;
-      conflictRow = node.row;
-      ownerKey = key;
-      break;
-    }
-    if (conflictRow != null && ownerKey != null) {
-      for (const node of nodesList) {
-        if (node.row < conflictRow) continue;
-        if (exclusiveRowKeyForNode(node) === ownerKey) continue;
-        node.row += 1;
-        changedIds.add(node.commit.visualId);
-      }
-    }
-    return changedIds;
-  };
-
-  const enforceExclusiveMergeColumns = (nodesList: Node[]): Set<string> => {
-    const changedIds = new Set<string>();
-    const orderedNodes = [...nodesList].sort((a, b) => {
-      if (a.column !== b.column) return a.column - b.column;
-      if (a.row !== b.row) return a.row - b.row;
-      return a.commit.visualId.localeCompare(b.commit.visualId);
-    });
-
-    let conflictColumn: number | null = null;
-    let ownerKey: string | null = null;
-    for (const node of orderedNodes) {
-      const key = exclusiveColumnKeyForNode(node);
-      if (!key) continue;
-      const columnNodes = orderedNodes.filter((candidate) => candidate.column === node.column);
-      if (columnNodes.every((candidate) => exclusiveColumnKeyForNode(candidate) === key)) continue;
-      conflictColumn = node.column;
-      ownerKey = key;
-      break;
-    }
-    if (conflictColumn != null && ownerKey != null) {
-      for (const node of nodesList) {
-        if (node.column < conflictColumn) continue;
-        if (exclusiveColumnKeyForNode(node) === ownerKey) continue;
+        return false;
+      };
+      while (columnCollides(node.column)) {
         node.column += 1;
-        columnByCommitVisualId.set(node.commit.visualId, node.column);
         changedIds.add(node.commit.visualId);
       }
+      const occupiedColumns = occupiedByRow.get(node.row) ?? new Map<number, string | null>();
+      occupiedColumns.set(node.column, collisionKey);
+      occupiedByRow.set(node.row, occupiedColumns);
+      occupiedRowCounts.set(node.row, (occupiedRowCounts.get(node.row) ?? 0) + 1);
+      occupiedColumnCounts.set(node.column, (occupiedColumnCounts.get(node.column) ?? 0) + 1);
+      if (exclusive) {
+        exclusiveRows.add(node.row);
+        exclusiveColumns.add(node.column);
+      }
+      columnByCommitVisualId.set(node.commit.visualId, node.column);
     }
     return changedIds;
   };
@@ -2023,21 +2006,53 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
     node.column = nextColumn;
     columnByCommitVisualId.set(node.commit.visualId, nextColumn);
   };
+  const renderNodesByClusterKey = new Map<string, Node[]>();
+  for (const node of renderNodes) {
+    const clusterKey = clusterKeyByCommitId.get(node.commit.visualId);
+    if (!clusterKey) continue;
+    const clusterNodes = renderNodesByClusterKey.get(clusterKey) ?? [];
+    clusterNodes.push(node);
+    renderNodesByClusterKey.set(clusterKey, clusterNodes);
+  }
   const shiftClearanceGroup = (node: Node, nextColumn: number): void => {
     const clusterKey = clusterKeyByCommitId.get(node.commit.visualId);
     const clusterIsVisibleGroup = !!clusterKey && (clusterCounts.get(clusterKey) ?? 1) > 1;
     const groupNodes = clusterIsVisibleGroup
-      ? renderNodes.filter((candidate) => clusterKeyByCommitId.get(candidate.commit.visualId) === clusterKey)
+      ? renderNodesByClusterKey.get(clusterKey) ?? [node]
       : [node];
     const delta = nextColumn - node.column;
     if (delta <= 0) return;
-    for (const groupNode of groupNodes) {
-      if (getNodePositionOverride(nodePositionOverrides, groupNode.commit)) continue;
-      shiftNodeColumn(groupNode, groupNode.column + delta);
+    const dependentNodes: Node[] = [];
+    const dependentIds = new Set<string>();
+    const pending = [...groupNodes];
+    while (pending.length > 0) {
+      const dependent = pending.pop()!;
+      if (dependentIds.has(dependent.commit.visualId)) continue;
+      dependentIds.add(dependent.commit.visualId);
+      dependentNodes.push(dependent);
+      pending.push(...(renderConstraintChildrenByVisualId.get(dependent.commit.visualId) ?? []));
+    }
+    for (const dependent of dependentNodes) {
+      if (getNodePositionOverride(nodePositionOverrides, dependent.commit)) continue;
+      shiftNodeColumn(dependent, dependent.column + delta);
     }
   };
+  const renderedNodesByExactSha = new Map<string, Node[]>();
+  const renderedNodeByBranchAndExactSha = new Map<string, Node>();
+  for (const node of renderNodes) {
+    const exactMatches = renderedNodesByExactSha.get(node.commit.id) ?? [];
+    exactMatches.push(node);
+    renderedNodesByExactSha.set(node.commit.id, exactMatches);
+    renderedNodeByBranchAndExactSha.set(`${node.commit.branchName}\0${node.commit.id}`, node);
+  }
   const renderedNodeForSha = (sha: string | null | undefined, preferredBranchName?: string): Node | null => {
     if (!sha) return null;
+    const exactPreferred = preferredBranchName
+      ? renderedNodeByBranchAndExactSha.get(`${preferredBranchName}\0${sha}`) ?? null
+      : null;
+    if (exactPreferred) return exactPreferred;
+    const exact = renderedNodesByExactSha.get(sha)?.[0] ?? null;
+    if (exact) return exact;
     const preferred = preferredBranchName
       ? renderNodes.find((node) => node.commit.branchName === preferredBranchName && shasMatch(node.commit.id, sha))
       : null;
@@ -2105,44 +2120,17 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
         mergeConnectorIntersectsNode,
       );
     }
-    const nodesByBranchForChains = new Map<string, Node[]>();
-    for (const node of renderNodes) {
-      const list = nodesByBranchForChains.get(node.commit.branchName) ?? [];
-      list.push(node);
-      nodesByBranchForChains.set(node.commit.branchName, list);
-    }
-    for (const [branchName, branchNodes] of nodesByBranchForChains.entries()) {
-      if (branchNodes.length < 2) continue;
-      const orderedBranchNodes = [...branchNodes].sort((a, b) => {
-        if (a.row !== b.row) return a.row - b.row;
-        return safeTimeMs(a.commit.date) - safeTimeMs(b.commit.date)
-          || a.commit.id.localeCompare(b.commit.id);
-      });
-      for (let index = 1; index < orderedBranchNodes.length; index += 1) {
-        const sourceNode = orderedBranchNodes[index - 1]!;
-        const targetNode = orderedBranchNodes[index]!;
-        if (targetNode.commit.parentSha && renderedNodeForSha(targetNode.commit.parentSha, targetNode.commit.branchName)) {
-          continue;
-        }
-        pushPair(
-          `chain:${branchName}:${sourceNode.commit.visualId}->${targetNode.commit.visualId}`,
-          sourceNode,
-          targetNode,
-          (source, target, blocker) => parentChildConnectorIntersectsNode(false, source, target, blocker),
-        );
-      }
-    }
     return pairs;
   };
+  const connectorPairs = renderedConnectorPairs().sort((left, right) => {
+    if (left.sourceNode.row !== right.sourceNode.row) return left.sourceNode.row - right.sourceNode.row;
+    if (left.targetNode.row !== right.targetNode.row) return left.targetNode.row - right.targetNode.row;
+    return left.id.localeCompare(right.id);
+  });
 
   const enforceConnectorClearance = (nodesList: Node[]): Set<string> => {
     const changedIds = new Set<string>();
     const requiredColumnByVisualId = new Map<string, number>();
-    const pairs = renderedConnectorPairs().sort((left, right) => {
-      if (left.sourceNode.row !== right.sourceNode.row) return left.sourceNode.row - right.sourceNode.row;
-      if (left.targetNode.row !== right.targetNode.row) return left.targetNode.row - right.targetNode.row;
-      return left.id.localeCompare(right.id);
-    });
     
     // Temporarily compute coordinates for intersection checks
     for (const node of nodesList) {
@@ -2155,24 +2143,18 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
       }
     }
 
-    for (const { sourceNode, targetNode, intersects } of pairs) {
-      const minColumn = Math.min(sourceNode.column, targetNode.column);
-      const maxColumn = Math.max(sourceNode.column, targetNode.column);
-      const minRow = Math.min(sourceNode.row, targetNode.row);
-      const maxRow = Math.max(sourceNode.row, targetNode.row);
-      const blockers = nodesList
-        .filter((candidate) => {
-          if (candidate.commit.visualId === sourceNode.commit.visualId) return false;
-          if (candidate.commit.visualId === targetNode.commit.visualId) return false;
-          return (
-            candidate.column >= minColumn &&
-            candidate.column <= maxColumn &&
-            candidate.row >= minRow &&
-            candidate.row <= maxRow
-          );
-        })
-        .filter((candidate) => intersects(sourceNode, targetNode, candidate));
-      for (const blocker of blockers) {
+    const pairIndex = buildRowSpanIndex(connectorPairs, (pair) => ({
+      from: pair.sourceNode.row,
+      to: pair.targetNode.row,
+    }));
+    for (const blocker of nodesList) {
+      for (const { sourceNode, targetNode, intersects } of queryRowSpanIndex(pairIndex, blocker.row)) {
+        if (blocker.commit.visualId === sourceNode.commit.visualId) continue;
+        if (blocker.commit.visualId === targetNode.commit.visualId) continue;
+        const minColumn = Math.min(sourceNode.column, targetNode.column);
+        const maxColumn = Math.max(sourceNode.column, targetNode.column);
+        if (blocker.column < minColumn || blocker.column > maxColumn) continue;
+        if (!intersects(sourceNode, targetNode, blocker)) continue;
         const nextColumn = Math.max(blocker.column + 1, sourceNode.column + 1, targetNode.column + 1);
         requiredColumnByVisualId.set(
           blocker.commit.visualId,
@@ -2199,45 +2181,28 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
     return changedIds;
   };
 
-  // Bound convergence loop
+  // Place in dependency order, then move complete dependent subtrees for connector clearance.
   let converged = false;
   let pass = 0;
   const maxPasses = 50;
   while (!converged && pass < maxPasses) {
     pass += 1;
-    const parentChanged = enforceVisibleParentConstraints(renderNodes);
-    const exclusiveRowChanged = enforceExclusiveMergeRows(renderNodes);
-    const exclusiveColChanged = enforceExclusiveMergeColumns(renderNodes);
-    const collisionChanged = resolveVisibleNodeColumnCollisions(
-      renderNodes,
-      columnByCommitVisualId,
-      isHorizontal,
-      zoomAwareLanePitch,
-      clusterKeyByCommitId,
-      clusterCounts,
-    );
+    const placementChanged = placeVisibleNodesInDependencyOrder();
     const clearanceChanged = enforceConnectorClearance(renderNodes);
 
-    if (
-      parentChanged.size === 0 &&
-      exclusiveRowChanged.size === 0 &&
-      exclusiveColChanged.size === 0 &&
-      collisionChanged.size === 0 &&
-      clearanceChanged.size === 0
-    ) {
+    if (placementChanged.size === 0 && clearanceChanged.size === 0) {
       converged = true;
     }
   }
 
   const normalizedNodePositionOverrides = migrateNodePositionOverridesForCommits(nodePositionOverrides, allCommitsWithClusters);
   maxResolvedRow = compactRenderNodeTimelineRows(renderNodes);
-  const baseReservedColumns = reservedClumpColumns(clumpOwnerColumnByClusterKey, clusterCounts);
   compactVisibleLaneColumns(
     renderNodes,
     columnByCommitVisualId,
     isHorizontal,
     zoomAwareLanePitch,
-    baseReservedColumns,
+    new Set<number>(),
   );
   syncClumpOwnerColumnsFromLeadNodes(
     renderNodes,
@@ -2247,23 +2212,6 @@ export function computeBaseLayout(input: BranchGridLayoutInput): BaseLayoutModel
     clumpOwnerColumnByClusterKey,
   );
 
-  // Final check to make sure overrides satisfy parent and collision requirements
-  enforceVisibleParentConstraints(renderNodes);
-  resolveVisibleNodeColumnCollisions(
-    renderNodes,
-    columnByCommitVisualId,
-    isHorizontal,
-    zoomAwareLanePitch,
-    clusterKeyByCommitId,
-    clusterCounts,
-  );
-  compactVisibleLaneColumns(
-    renderNodes,
-    columnByCommitVisualId,
-    isHorizontal,
-    zoomAwareLanePitch,
-    reservedClumpColumns(clumpOwnerColumnByClusterKey, clusterCounts),
-  );
   maxResolvedRow = Math.max(0, ...renderNodes.map((node) => node.row));
   
   syncRenderNodeTimelineCoordinates(
@@ -2424,8 +2372,10 @@ export function projectVisibility(
   }
 
   const isClumpOpen = (clusterKey: string): boolean =>
-    searchOpenedClumps.has(clusterKey) ||
-    isClusterClumpOpen(clusterKey, manuallyOpenedClumps, defaultCollapsedClumps, manuallyClosedClumps);
+    !manuallyClosedClumps.has(clusterKey) && (
+      searchOpenedClumps.has(clusterKey) ||
+      isClusterClumpOpen(clusterKey, manuallyOpenedClumps, defaultCollapsedClumps, manuallyClosedClumps)
+    );
 
   // Filter visible commits
   const visibleCommitsList = allCommits.filter((commit) => {
@@ -2465,6 +2415,15 @@ export function projectVisibility(
     columnByCommitVisualId.set(commit.visualId, projectedNode.column);
   }
 
+  const projectedNodesByExactSha = new Map<string, Node[]>();
+  const projectedNodeByBranchAndExactSha = new Map<string, Node>();
+  for (const node of renderNodes) {
+    const exactMatches = projectedNodesByExactSha.get(node.commit.id) ?? [];
+    exactMatches.push(node);
+    projectedNodesByExactSha.set(node.commit.id, exactMatches);
+    projectedNodeByBranchAndExactSha.set(`${node.commit.branchName}\0${node.commit.id}`, node);
+  }
+
   // Preserve clump owner columns and project open clumps (shifting columns)
   const projectedClumpOwnerColumn = new Map<string, number>(clumpOwnerColumnByClusterKey);
   syncClumpOwnerColumnsFromLeadNodes(
@@ -2485,6 +2444,15 @@ export function projectVisibility(
     .filter((value): value is { clusterKey: string; count: number; ownerColumn: number } => value != null)
     .sort((a, b) => a.ownerColumn - b.ownerColumn || a.clusterKey.localeCompare(b.clusterKey));
 
+  const openClumpKeys = new Set(openClumps.map((clump) => clump.clusterKey));
+  const occupiedStableCells = new Set(
+    renderNodes
+      .filter((node) => {
+        const clusterKey = clusterKeyByCommitId.get(node.commit.visualId);
+        return !clusterKey || !openClumpKeys.has(clusterKey);
+      })
+      .map((node) => `${node.row}:${node.column}`),
+  );
   for (const clump of openClumps) {
     const memberNodes = renderNodes.filter(
       (node) => clusterKeyByCommitId.get(node.commit.visualId) === clump.clusterKey,
@@ -2492,23 +2460,34 @@ export function projectVisibility(
     const ownerColumn = projectedClumpOwnerColumn.get(clump.clusterKey);
     if (ownerColumn == null) continue;
 
-    // Position clump members sequentially
+    // Keep existing lanes stable. The opened clump moves as one local block.
     const leadVisualId = leadByClusterKey.get(clump.clusterKey);
     const orderedMembers = [...memberNodes].sort((left, right) => {
-      if (left.commit.visualId === leadVisualId) return -1;
-      if (right.commit.visualId === leadVisualId) return 1;
+      if (left.commit.visualId === leadVisualId) return 1;
+      if (right.commit.visualId === leadVisualId) return -1;
       return (
-        safeTimeMs(right.commit.date) - safeTimeMs(left.commit.date)
-        || right.commit.id.localeCompare(left.commit.id)
-        || right.commit.visualId.localeCompare(left.commit.visualId)
+        safeTimeMs(left.commit.date) - safeTimeMs(right.commit.date)
+        || left.commit.id.localeCompare(right.commit.id)
+        || left.commit.visualId.localeCompare(right.commit.visualId)
       );
     });
+    const sharedRow = memberNodes[0]?.row ?? 0;
+    const desiredBandStart = Math.max(0, ownerColumn - orderedMembers.length + 1);
+    const bandIsOccupied = (startColumn: number) => orderedMembers.some(
+      (_, index) => occupiedStableCells.has(`${sharedRow}:${startColumn + index}`),
+    );
+    let bandStartColumn = desiredBandStart;
+    while (bandIsOccupied(bandStartColumn)) bandStartColumn += 1;
     orderedMembers.forEach((node, index) => {
-      const nextColumn = ownerColumn + index;
+      const nextColumn = bandStartColumn + index;
       node.column = nextColumn;
       columnByCommitVisualId.set(node.commit.visualId, nextColumn);
+      occupiedStableCells.add(`${sharedRow}:${nextColumn}`);
     });
-    projectedClumpOwnerColumn.set(clump.clusterKey, ownerColumn);
+    const leadNode = leadVisualId
+      ? orderedMembers.find((node) => node.commit.visualId === leadVisualId) ?? null
+      : null;
+    projectedClumpOwnerColumn.set(clump.clusterKey, leadNode?.column ?? bandStartColumn);
   }
 
   const latestOpenClumpNodeForSha = (
@@ -2526,7 +2505,7 @@ export function projectVisibility(
     for (const clusterKey of [...new Set(clusterKeys)]) {
       if ((clusterCounts.get(clusterKey) ?? 1) <= 1 || !isClumpOpen(clusterKey)) continue;
       const leadVisualId = leadByClusterKey.get(clusterKey);
-      const leadNode = leadVisualId ? renderNodes.find((node) => node.commit.visualId === leadVisualId) : null;
+      const leadNode = leadVisualId ? projectedNodeByVisualId.get(leadVisualId) ?? null : null;
       if (leadNode) return leadNode;
     }
     return null;
@@ -2541,18 +2520,10 @@ export function projectVisibility(
       ?? null
     );
   };
-  const hasLogicalNodePositionOverrides = false;
-
-  resolveVisibleNodeColumnCollisions(
-    renderNodes,
-    columnByCommitVisualId,
-    isHorizontal,
-    zoomAwareLanePitch,
-    clusterKeyByCommitId,
-    clusterCounts,
-  );
   const projectedNodeForSha = (sha: string, preferredBranchName: string): Node | null =>
-    renderNodes.find((node) => node.commit.branchName === preferredBranchName && shasMatch(node.commit.id, sha))
+    projectedNodeByBranchAndExactSha.get(`${preferredBranchName}\0${sha}`)
+    ?? projectedNodesByExactSha.get(sha)?.[0]
+    ?? renderNodes.find((node) => node.commit.branchName === preferredBranchName && shasMatch(node.commit.id, sha))
     ?? renderNodes.find((node) => shasMatch(node.commit.id, sha))
     ?? null;
   const projectedConnectorNodeForSha = (
@@ -2572,68 +2543,30 @@ export function projectVisibility(
     if (!clusterKey) return null;
     return renderNodes.find((node) => clusterKeyByCommitId.get(node.commit.visualId) === clusterKey) ?? null;
   };
-  for (let pass = 0; pass < renderNodes.length; pass += 1) {
-    let changed = false;
-    for (const node of renderNodes) {
-      const nodeClusterKey = clusterKeyByCommitId.get(node.commit.visualId);
-      const parentShas = new Set([
-        actualWorktreeParentSha(node.commit),
-        ...(node.commit.parentShas ?? []),
-      ].filter((sha): sha is string => !!sha));
-      let requiredColumn = node.column;
-      for (const parentSha of parentShas) {
-        const parentNode = projectedConnectorNodeForSha(parentSha, node.commit.branchName);
-        if (!parentNode) continue;
-        const parentClusterKey = clusterKeyByCommitId.get(parentNode.commit.visualId);
-        if (nodeClusterKey && nodeClusterKey === parentClusterKey) continue;
-        requiredColumn = Math.max(requiredColumn, parentNode.column + 1);
-      }
-      if (requiredColumn <= node.column) continue;
-      node.column = requiredColumn;
-      columnByCommitVisualId.set(node.commit.visualId, requiredColumn);
-      changed = true;
-    }
-    if (!changed) break;
-  }
-  for (let pass = 0; pass < branches.length; pass += 1) {
-    let changed = false;
-    for (const branch of branches) {
-      if (branch.name === defaultBranch) continue;
-      const branchBaseCommit = branchBaseCommitByName.get(branch.name);
-      if (!branchBaseCommit) continue;
-      const receivingCommit = branchReceivingCommitByName.get(branch.name) ?? branchBaseCommit;
-      const parentSha = receivingCommit.parentSha ?? branchStartParentShaByName.get(branch.name) ?? null;
-      if (!parentSha) continue;
-      const parentBranchName = resolveBranchStartParentName(branch);
-      const parentNode = projectedConnectorNodeForSha(parentSha, parentBranchName);
-      const childNode = projectedConnectorNodeForSha(receivingCommit.id, branch.name);
-      if (!parentNode || !childNode || parentNode.commit.visualId === childNode.commit.visualId) continue;
-      const requiredRow = parentNode.row + 1;
-      if (childNode.row >= requiredRow) continue;
-      childNode.row = requiredRow;
-      changed = true;
-    }
-    if (!changed) break;
-  }
-
   type CanonicalEdge = { parent: Node; child: Node; sharesTimelineColumn: boolean };
   const canonicalEdges: CanonicalEdge[] = [];
   const canonicalEdgeKeys = new Set<string>();
   const canonicalChildrenByVisualId = new Map<string, Set<string>>();
+  const canonicalPathExists = (fromVisualId: string, targetVisualId: string): boolean => {
+    const pending = [fromVisualId];
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const visualId = pending.pop()!;
+      if (visualId === targetVisualId) return true;
+      if (seen.has(visualId)) continue;
+      seen.add(visualId);
+      for (const childVisualId of canonicalChildrenByVisualId.get(visualId) ?? []) {
+        pending.push(childVisualId);
+      }
+    }
+    return false;
+  };
   const addCanonicalEdge = (parent: Node | null, child: Node | null): void => {
     if (!parent || !child || parent.commit.visualId === child.commit.visualId) return;
+    if (parent.commit.id === child.commit.id) return;
     const key = `${parent.commit.visualId}->${child.commit.visualId}`;
     if (canonicalEdgeKeys.has(key)) return;
-    const reaches = (fromVisualId: string, targetVisualId: string, seen = new Set<string>()): boolean => {
-      if (fromVisualId === targetVisualId) return true;
-      if (seen.has(fromVisualId)) return false;
-      seen.add(fromVisualId);
-      for (const nextVisualId of canonicalChildrenByVisualId.get(fromVisualId) ?? []) {
-        if (reaches(nextVisualId, targetVisualId, seen)) return true;
-      }
-      return false;
-    };
-    if (reaches(child.commit.visualId, parent.commit.visualId)) return;
+    if (canonicalPathExists(child.commit.visualId, parent.commit.visualId)) return;
     canonicalEdgeKeys.add(key);
     const parentClusterKey = clusterKeyByCommitId.get(parent.commit.visualId);
     const childClusterKey = clusterKeyByCommitId.get(child.commit.visualId);
@@ -2722,17 +2655,6 @@ export function projectVisibility(
     list.push(node);
     visibleByBranch.set(node.commit.branchName, list);
   }
-  for (const branchNodes of visibleByBranch.values()) {
-    const chainNodes = branchNodes.filter((node) => !isWorktreeGraphNode(node.commit));
-    chainNodes.sort(
-      (left, right) =>
-        safeTimeMs(left.commit.date) - safeTimeMs(right.commit.date)
-        || left.commit.id.localeCompare(right.commit.id),
-    );
-    for (let index = 1; index < chainNodes.length; index += 1) {
-      addCanonicalEdge(chainNodes[index - 1]!, chainNodes[index]!);
-    }
-  }
   for (const child of renderNodes) {
     if (!isWorktreeGraphNode(child.commit)) continue;
     const parentSha = actualWorktreeParentSha(child.commit);
@@ -2785,15 +2707,20 @@ export function projectVisibility(
   );
   const canonicalSubtreeRankByVisualId = new Map<string, number>();
   let canonicalSubtreeRank = 0;
-  const assignCanonicalSubtreeRanks = (node: Node, visiting = new Set<string>()): void => {
-    if (visiting.has(node.commit.visualId) || canonicalSubtreeRankByVisualId.has(node.commit.visualId)) return;
-    visiting.add(node.commit.visualId);
-    canonicalSubtreeRankByVisualId.set(node.commit.visualId, canonicalSubtreeRank);
-    canonicalSubtreeRank += 1;
-    const children = [...(childrenByVisualId.get(node.commit.visualId) ?? [])].sort(
-      compareCanonicalNodes,
-    );
-    for (const child of children) assignCanonicalSubtreeRanks(child, new Set(visiting));
+  const assignCanonicalSubtreeRanks = (root: Node): void => {
+    const pending = [root];
+    while (pending.length > 0) {
+      const node = pending.pop()!;
+      if (canonicalSubtreeRankByVisualId.has(node.commit.visualId)) continue;
+      canonicalSubtreeRankByVisualId.set(node.commit.visualId, canonicalSubtreeRank);
+      canonicalSubtreeRank += 1;
+      const children = [...(childrenByVisualId.get(node.commit.visualId) ?? [])].sort(
+        compareCanonicalNodes,
+      );
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        pending.push(children[index]!);
+      }
+    }
   };
   for (const node of canonicalOrder) {
     if ((incomingByVisualId.get(node.commit.visualId) ?? []).length === 0) {
@@ -2806,150 +2733,6 @@ export function projectVisibility(
       (canonicalSubtreeRankByVisualId.get(left.commit.visualId) ?? Number.MAX_SAFE_INTEGER)
       - (canonicalSubtreeRankByVisualId.get(right.commit.visualId) ?? Number.MAX_SAFE_INTEGER),
   );
-  const syncProjectedCoordinates = (): void => {
-    const projectedMaxRow = Math.max(0, ...renderNodes.map((node) => node.row));
-    syncRenderNodeTimelineCoordinates(
-      renderNodes,
-      isHorizontal,
-      projectedMaxRow,
-      0,
-      zoomAwareTimelinePitch,
-      zoomAwareLanePitch,
-      () => false,
-    );
-  };
-  const setProjectedNodeColumn = (node: Node, column: number): void => {
-    node.column = column;
-    if (isHorizontal) {
-      node.x = LEFT_PADDING + (node.row - 1) * zoomAwareTimelinePitch;
-      node.y = TOP_PADDING + column * zoomAwareLanePitch;
-      return;
-    }
-    const projectedMaxRow = Math.max(0, ...renderNodes.map((candidate) => candidate.row));
-    node.x = LEFT_PADDING + column * COLUMN_WIDTH;
-    node.y = TOP_PADDING + (projectedMaxRow - node.row) * zoomAwareTimelinePitch;
-  };
-  const projectedConnectorIntersectsNode = (
-    parentNode: Node,
-    childNode: Node,
-    blocker: Node,
-  ): boolean => {
-    const anchors = computeParentChildConnectorAnchors(
-      isHorizontal,
-      parentNode.commit.branchName !== childNode.commit.branchName,
-      parentNode,
-      childNode,
-    );
-    const points = getMapGridConnectorPolyline(
-      anchors.fromX,
-      anchors.fromY,
-      anchors.toX,
-      anchors.toY,
-      anchors.fromFace,
-      anchors.toFace,
-    );
-    const rect = {
-      left: blocker.x,
-      right: blocker.x + CARD_WIDTH,
-      top: blocker.y - CARD_BODY_TOP_OFFSET,
-      bottom: blocker.y + CARD_HEIGHT,
-    };
-    for (let index = 1; index < points.length; index += 1) {
-      const start = points[index - 1]!;
-      const end = points[index]!;
-      const minX = Math.min(start.x, end.x);
-      const maxX = Math.max(start.x, end.x);
-      const minY = Math.min(start.y, end.y);
-      const maxY = Math.max(start.y, end.y);
-      if (Math.abs(start.x - end.x) < 0.5) {
-        if (start.x >= rect.left && start.x <= rect.right && maxY >= rect.top && minY <= rect.bottom) return true;
-        continue;
-      }
-      if (Math.abs(start.y - end.y) < 0.5) {
-        if (start.y >= rect.top && start.y <= rect.bottom && maxX >= rect.left && minX <= rect.right) return true;
-        continue;
-      }
-      if (maxX >= rect.left && minX <= rect.right && maxY >= rect.top && minY <= rect.bottom) return true;
-    }
-    return false;
-  };
-  const nodeBlockedByRenderedConnectorAtColumn = (node: Node, column: number): boolean => {
-    if (node.commit.kind === 'stash' || node.commit.id.startsWith('STASH:')) return false;
-    const previousColumn = node.column;
-    const previousX = node.x;
-    const previousY = node.y;
-    node.column = column;
-    setProjectedNodeColumn(node, column);
-    const blocked = canonicalEdges.some((edge) => {
-      if (edge.parent.commit.visualId === node.commit.visualId) return false;
-      if (edge.child.commit.visualId === node.commit.visualId) return false;
-      return projectedConnectorIntersectsNode(edge.parent, edge.child, node);
-    });
-    node.column = previousColumn;
-    node.x = previousX;
-    node.y = previousY;
-    return blocked;
-  };
-  const requiredColumnForNode = (node: Node): number => {
-    const incoming = incomingByVisualId.get(node.commit.visualId) ?? [];
-    if (incoming.length === 0) return 0;
-    return Math.max(...incoming.map((edge) => edge.parent.column + 1));
-  };
-  for (let pass = 0; !hasLogicalNodePositionOverrides && pass < renderNodes.length * 2; pass += 1) {
-    let changed = false;
-    for (const node of canonicalOrder) {
-      const incoming = incomingByVisualId.get(node.commit.visualId) ?? [];
-      if (incoming.length === 0) continue;
-      const requiredRow = Math.max(
-        ...incoming.map((edge) => edge.parent.row + (edge.sharesTimelineColumn ? 0 : 1)),
-      );
-      if (node.row < requiredRow) {
-        node.row = requiredRow;
-        changed = true;
-      }
-    }
-    syncProjectedCoordinates();
-    for (const children of childrenByVisualId.values()) {
-      children.sort(
-        (left, right) =>
-          (canonicalSubtreeRankByVisualId.get(left.commit.visualId) ?? Number.MAX_SAFE_INTEGER)
-          - (canonicalSubtreeRankByVisualId.get(right.commit.visualId) ?? Number.MAX_SAFE_INTEGER),
-      );
-      const usedByRow = new Map<number, Set<number>>();
-      for (const child of children) {
-        const used = usedByRow.get(child.row) ?? new Set<number>();
-        let column = Math.max(requiredColumnForNode(child), 0);
-        while (
-          used.has(column)
-          || nodeBlockedByRenderedConnectorAtColumn(child, column)
-        ) {
-          column += 1;
-        }
-        if (child.column !== column) {
-          setProjectedNodeColumn(child, column);
-          changed = true;
-        }
-        used.add(child.column);
-        usedByRow.set(child.row, used);
-      }
-    }
-    const occupied = new Set<string>();
-    for (const node of nodesByCanonicalSubtreeRank) {
-      let column = Math.max(requiredColumnForNode(node), 0);
-      while (
-        occupied.has(`${node.row}:${column}`)
-        || nodeBlockedByRenderedConnectorAtColumn(node, column)
-      ) {
-        column += 1;
-      }
-      if (node.column !== column) {
-        setProjectedNodeColumn(node, column);
-        changed = true;
-      }
-      occupied.add(`${node.row}:${node.column}`);
-    }
-    if (!changed) break;
-  }
   for (const [clusterKey, count] of clusterCounts) {
     if (count <= 1 || !isClumpOpen(clusterKey)) continue;
     const memberNodes = renderNodes.filter(
@@ -2962,48 +2745,6 @@ export function projectVisibility(
     if (memberNodes.length <= 1) continue;
     const sharedRow = Math.max(...memberNodes.map((node) => node.row));
     for (const node of memberNodes) node.row = sharedRow;
-  }
-  for (let pass = 0; !hasLogicalNodePositionOverrides && pass < renderNodes.length; pass += 1) {
-    let changed = false;
-    for (const node of canonicalOrder) {
-      const incoming = incomingByVisualId.get(node.commit.visualId) ?? [];
-      if (incoming.length === 0) continue;
-      const requiredRow = Math.max(
-        ...incoming.map((edge) => edge.parent.row + (edge.sharesTimelineColumn ? 0 : 1)),
-      );
-      const requiredColumn = Math.max(...incoming.map((edge) => edge.parent.column + 1));
-      if (node.row < requiredRow) {
-        node.row = requiredRow;
-        changed = true;
-      }
-      if (node.column < requiredColumn) {
-        node.column = requiredColumn;
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
-  if (!hasLogicalNodePositionOverrides) {
-    const minSolvedRow = Math.min(...renderNodes.map((node) => node.row));
-    const minSolvedColumn = Math.min(...renderNodes.map((node) => node.column));
-    for (const node of renderNodes) {
-      node.row -= minSolvedRow;
-      node.column -= minSolvedColumn;
-    }
-    syncClumpOwnerColumnsFromLeadNodes(
-      renderNodes,
-      clusterKeyByCommitId,
-      clusterCounts,
-      leadByClusterKey,
-      projectedClumpOwnerColumn,
-    );
-    compactVisibleLaneColumns(
-      renderNodes,
-      columnByCommitVisualId,
-      isHorizontal,
-      zoomAwareLanePitch,
-      reservedClumpColumns(projectedClumpOwnerColumn, clusterCounts),
-    );
   }
   const pinnedOverrideNodeIds = applyNodePositionOverrides({
     renderNodes,
@@ -3018,37 +2759,50 @@ export function projectVisibility(
     maxResolvedRow: Math.max(0, ...renderNodes.map((node) => node.row)),
   });
   const isPinnedOverrideNode = (node: Node): boolean => pinnedOverrideNodeIds.has(node.commit.visualId);
-  resolveOverrideAwareNodeCollisions({
-    renderNodes,
-    overrides: nodePositionOverrides,
-    isPinnedNode: isPinnedOverrideNode,
-  });
 
-  for (let pass = 0; !hasLogicalNodePositionOverrides && pass < renderNodes.length; pass += 1) {
-    let changed = false;
-    for (const node of canonicalOrder) {
-      const incoming = incomingByVisualId.get(node.commit.visualId) ?? [];
-      if (incoming.length === 0) continue;
-      const requiredRow = Math.max(
-        ...incoming.map((edge) => edge.parent.row + (edge.sharesTimelineColumn ? 0 : 1)),
-      );
-      const requiredColumn = Math.max(...incoming.map((edge) => edge.parent.column + 1));
-      if (node.row < requiredRow) {
-        node.row = requiredRow;
-        changed = true;
-      }
-      if (node.column < requiredColumn) {
-        node.column = requiredColumn;
-        changed = true;
-      }
+  for (const node of nodesByCanonicalSubtreeRank) {
+    if (
+      !isWorktreeGraphNode(node.commit)
+      && !pinnedOverrideNodeIds.has(node.commit.visualId)
+    ) {
+      continue;
     }
-    if (!changed) break;
+    const incoming = incomingByVisualId.get(node.commit.visualId) ?? [];
+    if (incoming.length === 0) continue;
+    const requiredRow = Math.max(
+      ...incoming.map((edge) => edge.parent.row + (edge.sharesTimelineColumn ? 0 : 1)),
+    );
+    const requiredColumn = Math.max(...incoming.map((edge) => edge.parent.column + 1));
+    if (node.row < requiredRow) node.row = requiredRow;
+    if (node.column < requiredColumn) node.column = requiredColumn;
   }
-  resolveOverrideAwareNodeCollisions({
-    renderNodes,
-    overrides: nodePositionOverrides,
-    isPinnedNode: isPinnedOverrideNode,
-  });
+  const movableProjectionVisualIds = new Set([
+    ...pinnedOverrideNodeIds,
+    ...renderNodes
+      .filter((node) => isWorktreeGraphNode(node.commit))
+      .map((node) => node.commit.visualId),
+  ]);
+  const occupiedProjectionCells = new Set(
+    renderNodes
+      .filter((node) => !movableProjectionVisualIds.has(node.commit.visualId))
+      .map((node) => `${node.row}:${node.column}`),
+  );
+  const movableProjectionNodes = renderNodes
+    .filter((node) => movableProjectionVisualIds.has(node.commit.visualId))
+    .sort((left, right) => {
+      const leftPinned = isPinnedOverrideNode(left);
+      const rightPinned = isPinnedOverrideNode(right);
+      if (leftPinned !== rightPinned) return leftPinned ? -1 : 1;
+      if (left.row !== right.row) return left.row - right.row;
+      if (left.column !== right.column) return left.column - right.column;
+      return left.commit.visualId.localeCompare(right.commit.visualId);
+    });
+  for (const node of movableProjectionNodes) {
+    let column = node.column;
+    while (occupiedProjectionCells.has(`${node.row}:${column}`)) column += 1;
+    node.column = column;
+    occupiedProjectionCells.add(`${node.row}:${column}`);
+  }
 
   for (const node of renderNodes) {
     allRowByVisualId.set(node.commit.visualId, node.row);
@@ -3556,82 +3310,6 @@ export function projectVisibility(
     });
     commitIdsWithRenderedAncestry.add(parentNode.commit.id);
     commitIdsWithRenderedAncestry.add(childNode.commit.id);
-  }
-
-  const nodesByBranch = new Map<string, Node[]>();
-  for (const node of renderNodes) {
-    const list = nodesByBranch.get(node.commit.branchName) ?? [];
-    list.push(node);
-    nodesByBranch.set(node.commit.branchName, list);
-  }
-  for (const [branchName, branchNodes] of nodesByBranch.entries()) {
-    if (branchNodes.length < 2) continue;
-    const orderedBranchNodes = [...branchNodes].sort((a, b) => {
-      if (a.row !== b.row) return a.row - b.row;
-      return safeTimeMs(a?.commit?.date ?? null) - safeTimeMs(b?.commit?.date ?? null)
-        || (a?.commit?.id ?? '').localeCompare(b?.commit?.id ?? '');
-    });
-    for (let index = 1; index < orderedBranchNodes.length; index += 1) {
-      const parentNode = orderedBranchNodes[index - 1]!;
-      const childNode = orderedBranchNodes[index]!;
-      if (parentNode.commit.id === childNode.commit.id) continue;
-      const realParentSha = childNode.commit.parentSha ?? null;
-      if (realParentSha) {
-        const resolvedRealParent = resolveParentNode(realParentSha, childNode.commit.branchName);
-        if (resolvedRealParent) continue;
-      }
-      if (isWorktreeConnectorSource(parentNode.commit)) {
-        pushConnectorDecision({
-          id: `chain:${branchName}:${parentNode.commit.id}->${childNode.commit.id}`,
-          kind: 'ancestry',
-          parent: parentNode.commit.id,
-          child: childNode.commit.id,
-          rendered: false,
-          reason: 'worktree nodes have no outgoing connectors',
-        });
-        continue;
-      }
-      const key = `chain:${branchName}:${parentNode.commit.id}->${childNode.commit.id}`;
-      if (connectorKeySet.has(key)) {
-        addNodeWarning(parentNode.commit.id, 'Duplicate branch chain connector');
-        addNodeWarning(childNode.commit.id, 'Duplicate branch chain connector');
-        pushConnectorDecision({
-          id: key,
-          kind: 'ancestry',
-          parent: parentNode.commit.id,
-          child: childNode.commit.id,
-          rendered: false,
-          reason: 'duplicate branch chain key',
-        });
-        continue;
-      }
-      connectorKeySet.add(key);
-      const anchors = computeParentChildConnectorAnchors(isHorizontal, false, parentNode, childNode);
-      connectors.push({
-        id: key,
-        fromX: anchors.fromX,
-        fromY: anchors.fromY,
-        toX: anchors.toX,
-        toY: anchors.toY,
-        fromFace: anchors.fromFace,
-        toFace: anchors.toFace,
-        zIndex: branchConnectorZIndex(childNode.commit.branchName),
-        fromCommitVisualId: parentNode.commit.visualId,
-        toCommitVisualId: childNode.commit.visualId,
-        useBranchFeedAnchors: false,
-        connectorEdgeKind: 'chain',
-      });
-      pushConnectorDecision({
-        id: key,
-        kind: 'ancestry',
-        parent: parentNode.commit.id,
-        child: childNode.commit.id,
-        rendered: true,
-        reason: 'branch chain rendered',
-      });
-      commitIdsWithRenderedAncestry.add(parentNode.commit.id);
-      commitIdsWithRenderedAncestry.add(childNode.commit.id);
-    }
   }
 
   // Debug outputs

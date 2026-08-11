@@ -24,6 +24,7 @@ import type { BranchGridLayoutModel } from '../components/grid/branchGridLayoutM
 import { hydrateBranchGridLayoutModel, serializeBranchGridLayoutModel } from '../components/grid/layoutSnapshot';
 import { buildGraphLayoutFingerprint, hashCommitShaList } from '../components/grid/graphLayoutFingerprint';
 import {
+  layoutModelMatchesManualClumpState,
   useBranchGridLayoutFromRevision,
   type BranchGridLayoutStatus,
 } from '../components/grid/useBranchGridLayoutFromRevision';
@@ -276,7 +277,7 @@ function makeLayoutCacheKey(
   nodePositionOverrides: NodePositionOverrides = {},
 ): string {
   return [
-    'layout-v11-branch-owner-fingerprint',
+    'layout-v13-dependency-owned-placement',
     path,
     'horizontal',
     setSignature(manuallyOpenedClumps),
@@ -389,8 +390,12 @@ function App() {
     state: 'idle',
     source: 'none',
     nodeEstimate: 0,
+    processedItems: 0,
+    totalItems: 0,
+    isPartial: false,
     durationMs: null,
     error: null,
+    cappedReason: null,
   });
   const [pendingInitialProjectPath, setPendingInitialProjectPath] = useState<string | null>(null);
   const [isEmptyAddProjectHovered, setIsEmptyAddProjectHovered] = useState(false);
@@ -5462,6 +5467,15 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
         if (layoutModelHasWorkingTree(hydrated) !== hasWorktreeNodes) {
           return;
         }
+        if (!layoutModelMatchesManualClumpState(
+          hydrated,
+          layoutRevisionForView.manuallyOpenedGridClumps,
+          layoutRevisionForView.manuallyClosedGridClumps,
+        )) {
+          layoutModelCacheRef.current.delete(sharedGridLayoutCacheKey);
+          persistedLayoutKeysRef.current.delete(sharedGridLayoutCacheKey);
+          return;
+        }
         layoutModelCacheRef.current.set(sharedGridLayoutCacheKey, hydrated);
         persistedLayoutKeysRef.current.add(sharedGridLayoutCacheKey);
         setHydratedLayoutModel(hydrated);
@@ -5475,7 +5489,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     return () => {
       disposed = true;
     };
-  }, [repoPath, sharedGridLayoutCacheKey, worktreeSessions]);
+  }, [layoutRevisionForView, repoPath, sharedGridLayoutCacheKey, worktreeSessions]);
   const layoutGridRevision = useMemo(
     () => ({
       repoPath: layoutRevisionForView.repoPath,
@@ -5505,9 +5519,16 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     if (!activePath) return;
     const key = projectLoadKey(activePath);
     if (status.state === 'computing' && isRepoSwitchingRef.current) {
+      const progressRatio = status.totalItems > 0
+        ? status.processedItems / status.totalItems
+        : 0;
       setProjectLoadStates((previous) => ({
         ...previous,
-        [key]: { status: 'loading', phase: 'Building map', progress: 95 },
+        [key]: {
+          status: 'loading',
+          phase: status.processedItems > 0 ? 'Expanding map' : 'Building map',
+          progress: Math.min(99, 95 + Math.floor(progressRatio * 4)),
+        },
       }));
       return;
     }
@@ -5527,7 +5548,11 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       }));
     }
   }, []);
-  const sharedGridLayoutModel = useBranchGridLayoutFromRevision({
+  const {
+    model: sharedGridLayoutModel,
+    isCurrent: sharedGridLayoutIsCurrent,
+    isComplete: sharedGridLayoutIsComplete,
+  } = useBranchGridLayoutFromRevision({
     layoutRevisionForView: layoutGridRevision,
     sharedGridLayoutCacheKey,
     hydratedLayoutModel,
@@ -5588,6 +5613,11 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
   ]);
   useEffect(() => {
     if (!repoPath || !sharedGridLayoutCacheKey) return;
+    if (!sharedGridLayoutIsCurrent || !sharedGridLayoutIsComplete) {
+      layoutModelCacheRef.current.delete(sharedGridLayoutCacheKey);
+      persistedLayoutKeysRef.current.delete(sharedGridLayoutCacheKey);
+      return;
+    }
     const hasGraphSourceData =
       layoutRevisionForView.branchesForLayout.length > 0 ||
       layoutRevisionForView.enrichedDirectCommits.length > 0 ||
@@ -5637,7 +5667,14 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       if (idleId != null && 'cancelIdleCallback' in window) window.cancelIdleCallback(idleId);
       if (fallbackId != null) clearTimeout(fallbackId);
     };
-  }, [repoPath, sharedGridLayoutCacheKey, sharedGridLayoutModel, layoutRevisionForView]);
+  }, [
+    repoPath,
+    sharedGridLayoutCacheKey,
+    sharedGridLayoutIsComplete,
+    sharedGridLayoutIsCurrent,
+    sharedGridLayoutModel,
+    layoutRevisionForView,
+  ]);
 
   useEffect(() => {
     try {
@@ -6759,10 +6796,42 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
                 gridHudProps={gridHudProps}
                 onShowContextMenu={showContextMenu}
               />
-              {mapLoading && mapLayoutStatus.state === 'computing' ? (
+              {mapLayoutStatus.state === 'computing' ? (
                 <div className="pointer-events-none absolute inset-x-0 bottom-5 z-[130] flex justify-center px-4">
                   <div className="pointer-events-auto flex items-center gap-3 rounded-xl border border-border bg-card/80 px-3 py-2 text-xs text-muted-foreground shadow-sm backdrop-blur-sm">
-                    <span>Building map for {mapLayoutStatus.nodeEstimate.toLocaleString()} items</span>
+                    <span>
+                      {mapLayoutStatus.processedItems > 0
+                        ? `Expanding map: ${mapLayoutStatus.processedItems.toLocaleString()} of ${mapLayoutStatus.totalItems.toLocaleString()} items`
+                        : `Building map for ${mapLayoutStatus.totalItems.toLocaleString()} items`}
+                    </span>
+                    {repoPath ? (
+                      <button
+                        type="button"
+                        onClick={() => void copyProjectDiagnostics(repoPath)}
+                        className="rounded-lg px-2 py-1 text-foreground transition-colors hover:bg-muted"
+                      >
+                        Copy diagnostics
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+              {mapLayoutStatus.state === 'ready' && mapLayoutStatus.isPartial ? (
+                <div className="pointer-events-none absolute inset-x-0 bottom-5 z-[130] flex justify-center px-4">
+                  <div className="pointer-events-auto flex items-center gap-3 rounded-xl border border-border bg-card/80 px-3 py-2 text-xs text-muted-foreground shadow-sm backdrop-blur-sm">
+                    <span>{mapLayoutStatus.cappedReason}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        beginMapSwitch();
+                        isRepoSwitchingRef.current = true;
+                        setMapLoading(true);
+                        setLayoutEpoch((epoch) => epoch + 1);
+                      }}
+                      className="rounded-lg px-2 py-1 text-foreground transition-colors hover:bg-muted"
+                    >
+                      Retry expansion
+                    </button>
                     {repoPath ? (
                       <button
                         type="button"

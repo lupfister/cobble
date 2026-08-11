@@ -2,7 +2,12 @@
   "name": "cobble",
   "version": "0.1.2",
   "private": true,
+  "packageManager": "pnpm@10.10.0",
   "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
     "dev": "vite",
     "dev:studio": "pnpm --filter pattern-studio dev",
@@ -20,7 +25,7 @@
     ]
   },
   "dependencies": {
-    "@cobble/tile-pattern-core": "workspace:*",
+    "@cobble/tile-pattern-core": "file:packages/tile-pattern-core",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",

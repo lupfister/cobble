@@ -12,7 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cobble/tile-pattern-core": "workspace:*"
+    "@cobble/tile-pattern-core": "file:../tile-pattern-core"
   },
   "devDependencies": {
     "typescript": "^5"

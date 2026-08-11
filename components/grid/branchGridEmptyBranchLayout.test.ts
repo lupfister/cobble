@@ -632,7 +632,7 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     expect(leadNode!.x).toBe(firstNode!.x);
   });
 
-  it('places open horizontal clump lanes oldest at top and newest at bottom with exclusive lanes', () => {
+  it('places open horizontal clump lanes oldest at top and newest at bottom without sharing cells', () => {
     const defaultBranch = 'main';
     const unpushedA = 'cccccccccccccccccccccccccccccccccccccccc';
     const unpushedB = 'dddddddddddddddddddddddddddddddddddddddd';
@@ -741,11 +741,11 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     );
     expect(chronologicalNodes.map((node) => node.column)).toEqual([bandStartColumn, bandStartColumn + 1, bandStartColumn + 2]);
     expect(chronologicalNodes.map((node) => node.y)).toEqual([...chronologicalNodes].map((node) => node.y).sort((a, b) => a - b));
-    const clumpColumns = new Set(clumpNodes.map((node) => node.column));
+    const clumpCells = new Set(clumpNodes.map((node) => `${node.row}:${node.column}`));
     const nonClumpNodesInBand = opened.renderNodes.filter(
       (node) =>
         opened.clusterKeyByCommitId.get(node.commit.visualId) !== clusterKey
-        && clumpColumns.has(node.column),
+        && clumpCells.has(`${node.row}:${node.column}`),
     );
     expect(nonClumpNodesInBand).toHaveLength(0);
     expect(new Set(clumpNodes.map((node) => node.x)).size).toBe(1);
@@ -1134,6 +1134,30 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
       (node) => layout.clusterKeyByCommitId.get(node.commit.visualId) === clusterKey,
     )).toHaveLength(1);
     expect(layout.leadByClusterKey.get(clusterKey!)).toBe(clumpNode!.commit.visualId);
+    const usedColumns = [...new Set(layout.renderNodes.map((node) => node.column))].sort((a, b) => a - b);
+    expect(usedColumns).toEqual(Array.from({ length: usedColumns.length }, (_, column) => column));
+
+    const focusedButManuallyClosed = computeBranchGridLayout({
+      branches,
+      mergeNodes: [],
+      directCommits,
+      unpushedDirectCommits,
+      unpushedCommitShasByBranch: { feature: [unpushedA, unpushedB, unpushedC] },
+      defaultBranch,
+      branchCommitPreviews: { main: [], feature: [] },
+      branchParentByName: { main: null, feature: 'main' },
+      branchUniqueAheadCounts: { main: 1, feature: 3 },
+      manuallyClosedClumps: new Set([clusterKey!]),
+      manuallyOpenedClumps: new Set<string>(),
+      isDebugOpen: false,
+      gridSearchQuery: '',
+      gridFocusSha: unpushedA,
+      checkedOutRef: null,
+      orientation: 'vertical' as const,
+    });
+    expect(focusedButManuallyClosed.renderNodes.filter(
+      (node) => focusedButManuallyClosed.clusterKeyByCommitId.get(node.commit.visualId) === clusterKey,
+    )).toHaveLength(1);
   });
 
   it('keeps a collapsed clump override when a new commit becomes the lead', () => {
@@ -1995,5 +2019,65 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
       (node) => node.commit.branchName === remoteBranchName && node.commit.id === remoteTipSha,
     );
     expect(remoteNode).toBeDefined();
+  });
+
+  it('does not invent a chain between commits whose Git parents are missing', () => {
+    const defaultBranch = 'main';
+    const missingParent = '9999999999999999999999999999999999999999';
+    const firstSha = '1111111111111111111111111111111111111111';
+    const secondSha = '2222222222222222222222222222222222222222';
+    const thirdSha = '3333333333333333333333333333333333333333';
+    const directCommits: DirectCommit[] = [
+      {
+        fullSha: firstSha,
+        sha: firstSha.slice(0, 7),
+        branch: defaultBranch,
+        message: 'first fork child',
+        author: 'first',
+        date: '2026-08-03T10:06:00Z',
+        parentSha: missingParent,
+        parentShas: [missingParent],
+      },
+      {
+        fullSha: secondSha,
+        sha: secondSha.slice(0, 7),
+        branch: defaultBranch,
+        message: 'second fork child',
+        author: 'second',
+        date: '2026-08-03T09:38:00Z',
+        parentSha: missingParent,
+        parentShas: [missingParent],
+      },
+      {
+        fullSha: thirdSha,
+        sha: thirdSha.slice(0, 7),
+        branch: defaultBranch,
+        message: 'third fork child',
+        author: 'third',
+        date: '2026-08-03T09:19:00Z',
+        parentSha: missingParent,
+        parentShas: [missingParent],
+      },
+    ];
+    const layout = computeBranchGridLayout({
+      branches: [makeBranch(defaultBranch, firstSha, 3)],
+      mergeNodes: [],
+      directCommits,
+      unpushedDirectCommits: [],
+      defaultBranch,
+      branchCommitPreviews: { [defaultBranch]: [] },
+      branchParentByName: { [defaultBranch]: null },
+      branchUniqueAheadCounts: { [defaultBranch]: 3 },
+      manuallyOpenedClumps: new Set(),
+      manuallyClosedClumps: new Set(),
+      isDebugOpen: false,
+      gridSearchQuery: '',
+      gridFocusSha: null,
+      checkedOutRef: null,
+      orientation: 'horizontal',
+    });
+
+    expect(layout.renderNodes).toHaveLength(3);
+    expect(layout.connectors.filter((connector) => connector.connectorEdgeKind === 'chain')).toEqual([]);
   });
 });

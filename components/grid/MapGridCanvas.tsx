@@ -41,7 +41,7 @@ import {
   worktreeSessionDisplayName,
 } from './mapGridUtils';
 
-import type { ConnectorFace, Node, NodePositionOverrides } from './LayoutGrid';
+import type { Connector, ConnectorFace, Node, NodePositionOverrides } from './LayoutGrid';
 import type { MapGridCameraState, MapGridCameraTargetLayout } from './useMapGridCamera';
 import { getNodePositionOverride } from './nodePositionOverrides';
 import {
@@ -152,6 +152,7 @@ type CommitCardProps = {
   manuallyOpenedClumps: Set<string>;
   renderedOpenClumps: Set<string>;
   manuallyClosedClumps: Set<string>;
+  closingClumps: Set<string>;
   defaultCollapsedClumps: Set<string>;
   leadByClusterKey: Map<string, string>;
   firstByClusterKey: Map<string, string>;
@@ -215,6 +216,7 @@ function areCommitCardPropsEqual(prev: Readonly<CommitCardProps>, next: Readonly
     prev.manuallyOpenedClumps === next.manuallyOpenedClumps &&
     prev.renderedOpenClumps === next.renderedOpenClumps &&
     prev.manuallyClosedClumps === next.manuallyClosedClumps &&
+    prev.closingClumps === next.closingClumps &&
     prev.defaultCollapsedClumps === next.defaultCollapsedClumps &&
     prev.leadByClusterKey === next.leadByClusterKey &&
     prev.firstByClusterKey === next.firstByClusterKey &&
@@ -253,6 +255,7 @@ const MapGridCommitCard = memo(function MapGridCommitCard({
   manuallyOpenedClumps,
   renderedOpenClumps,
   manuallyClosedClumps,
+  closingClumps,
   defaultCollapsedClumps,
   leadByClusterKey,
   firstByClusterKey,
@@ -325,7 +328,17 @@ const MapGridCommitCard = memo(function MapGridCommitCard({
   }, [animateClumpEntry, clumpAnimationIndex, reduceMotion]);
   useEffect(() => {
     const visual = cardVisualRef.current;
-    if (!visual || reduceMotion || !animateClumpExit) return;
+    if (!visual) return;
+    if (!animateClumpExit) {
+      visual.style.opacity = '1';
+      return;
+    }
+    if (reduceMotion) {
+      visual.style.opacity = '0';
+      return () => {
+        visual.style.opacity = '1';
+      };
+    }
     const animation = visual.animate(
       [{ opacity: 1 }, { opacity: 0 }],
       {
@@ -342,9 +355,11 @@ const MapGridCommitCard = memo(function MapGridCommitCard({
   const branchName = node.commit.branchName;
   const clusterKey = clusterKeyByCommitId.get(visualId) ?? null;
   const isClusterOpen = clusterKey
-    ? renderedOpenClumps.has(clusterKey) ||
+    ? !closingClumps.has(clusterKey) && !manuallyClosedClumps.has(clusterKey) && (
+      renderedOpenClumps.has(clusterKey) ||
       manuallyOpenedClumps.has(clusterKey) ||
-      (!defaultCollapsedClumps.has(clusterKey) && !manuallyClosedClumps.has(clusterKey))
+      !defaultCollapsedClumps.has(clusterKey)
+    )
     : false;
   const clumpCount = clusterKey ? clusterCounts.get(clusterKey) ?? 1 : 1;
   const isClusterLead = clusterKey ? leadByClusterKey.get(clusterKey) === visualId : false;
@@ -757,12 +772,18 @@ const MapGridCommitCard = memo(function MapGridCommitCard({
             {isClusterCaretHost ? (
               <button
                 type="button"
+                aria-label={isClusterOpen ? `Collapse ${clumpCount} commits` : `Expand ${clumpCount} commits`}
                 onMouseDown={(event) => {
                   event.stopPropagation();
                 }}
                 onClick={handleClusterButtonClick}
-                className="inline-flex items-center bg-transparent p-0 font-normal leading-none"
-                style={scaledTextStyle}
+                className="-m-1 inline-flex min-h-6 min-w-6 items-center justify-center rounded-md bg-transparent p-1 font-normal leading-none transition-colors hover:bg-accent active:bg-muted"
+                style={{
+                  ...scaledTextStyle,
+                  minHeight: 'calc(1.5rem * var(--map-inv-zoom, 1))',
+                  minWidth: 'calc(1.5rem * var(--map-inv-zoom, 1))',
+                  padding: 'calc(0.25rem * var(--map-inv-zoom, 1))',
+                }}
               >
                 {isClusterOpen ? (
                   <span className="-translate-x-[1px] translate-y-[2px] leading-none" style={{ fontSize: 'calc(1rem * var(--map-inv-zoom, 1))' }}>⌃</span>
@@ -940,8 +961,8 @@ type Props = {
   clusterCounts: Map<string, number>;
   commitCornerRadiusPx: number;
   lineStrokeWidth: number;
-  connectors: Array<{ id: string; fromX: number; fromY: number; toX: number; toY: number; zIndex: number; fromFace?: ConnectorFace; toFace?: ConnectorFace }>;
-  mergeConnectors: Array<{ id: string; fromX: number; fromY: number; toX: number; toY: number; zIndex: number; fromFace?: ConnectorFace; toFace?: ConnectorFace }>;
+  connectors: Connector[];
+  mergeConnectors: Connector[];
   cullConnectorPath: (connector: { id: string; fromX: number; fromY: number; toX: number; toY: number; fromFace?: ConnectorFace; toFace?: ConnectorFace }) => boolean;
   flushCameraReactTick: () => void;
   syncCamera: (panX: number, panY: number, zoom: number, options?: { animate?: boolean; persist?: boolean }) => void;
@@ -1057,50 +1078,65 @@ const MapGridCanvas = memo(function MapGridCanvas({
 
   const pendingClumpCameraAnchorRef = useRef<{ clusterKey: string; x: number; y: number } | null>(null);
   const [closingClumps, setClosingClumps] = useState<Set<string>>(() => new Set());
-  const closingClumpTimeoutsRef = useRef(new Map<string, number>());
-  useEffect(() => () => {
-    for (const timeout of closingClumpTimeoutsRef.current.values()) window.clearTimeout(timeout);
-  }, []);
+  useEffect(() => {
+    setClosingClumps(new Set());
+  }, [currentRepoPath]);
+  useEffect(() => {
+    setClosingClumps((previous) => {
+      let changed = false;
+      const next = new Set(previous);
+      for (const clusterKey of previous) {
+        if (renderedOpenClumps.has(clusterKey)) continue;
+        next.delete(clusterKey);
+        changed = true;
+      }
+      return changed ? next : previous;
+    });
+  }, [renderedOpenClumps]);
   const handleClusterToggle = useCallback((clusterKey: string, anchor: { x: number; y: number }) => {
     pendingClumpCameraAnchorRef.current = { clusterKey, ...anchor };
     const isDefaultOpen = !defaultCollapsedClumps.has(clusterKey);
     const isOpen =
-      renderedOpenClumps.has(clusterKey) ||
-      manuallyOpenedClumps.has(clusterKey) ||
-      (isDefaultOpen && !manuallyClosedClumps.has(clusterKey));
+      !closingClumps.has(clusterKey) && !manuallyClosedClumps.has(clusterKey) && (
+        renderedOpenClumps.has(clusterKey) ||
+        manuallyOpenedClumps.has(clusterKey) ||
+        isDefaultOpen
+      );
     if (isOpen) {
       setClosingClumps((previous) => new Set(previous).add(clusterKey));
-      const count = clusterCounts.get(clusterKey) ?? 1;
-      const timeout = window.setTimeout(() => {
-        closingClumpTimeoutsRef.current.delete(clusterKey);
-        setClosingClumps((previous) => {
+      if (isDefaultOpen) {
+        setManuallyOpenedClumps((previous) => {
+          if (!previous.has(clusterKey)) return previous;
           const next = new Set(previous);
           next.delete(clusterKey);
           return next;
         });
-        if (isDefaultOpen) {
-          setManuallyOpenedClumps((previous) => {
-            const next = new Set(previous);
-            next.delete(clusterKey);
-            return next;
-          });
-          setManuallyClosedClumps((previous) => new Set(previous).add(clusterKey));
-        } else {
-          setManuallyClosedClumps((previous) => {
-            const next = new Set(previous);
-            next.delete(clusterKey);
-            return next;
-          });
-          setManuallyOpenedClumps((previous) => {
-            const next = new Set(previous);
-            next.delete(clusterKey);
-            return next;
-          });
-        }
-      }, 110 + Math.min(Math.max(0, count - 1), 5) * 16);
-      closingClumpTimeoutsRef.current.set(clusterKey, timeout);
+        setManuallyClosedClumps((previous) => {
+          if (previous.has(clusterKey)) return previous;
+          return new Set(previous).add(clusterKey);
+        });
+      } else {
+        setManuallyClosedClumps((previous) => {
+          if (!previous.has(clusterKey)) return previous;
+          const next = new Set(previous);
+          next.delete(clusterKey);
+          return next;
+        });
+        setManuallyOpenedClumps((previous) => {
+          if (!previous.has(clusterKey)) return previous;
+          const next = new Set(previous);
+          next.delete(clusterKey);
+          return next;
+        });
+      }
       return;
     }
+    setClosingClumps((previous) => {
+      if (!previous.has(clusterKey)) return previous;
+      const next = new Set(previous);
+      next.delete(clusterKey);
+      return next;
+    });
     if (isDefaultOpen) {
       setManuallyOpenedClumps((prev) => {
         if (!prev.has(clusterKey)) return prev;
@@ -1130,6 +1166,7 @@ const MapGridCanvas = memo(function MapGridCanvas({
     }
   }, [
     clusterCounts,
+    closingClumps,
     defaultCollapsedClumps,
     manuallyClosedClumps,
     manuallyOpenedClumps,
@@ -1156,6 +1193,17 @@ const MapGridCanvas = memo(function MapGridCanvas({
     const camera = renderedCameraRef.current;
     syncCamera(camera.panX + deltaX, camera.panY + deltaY, camera.zoom, { persist: false });
   }, [firstByClusterKey, renderedCameraRef, syncCamera, visibleRenderNodes]);
+
+  const optimisticallyHiddenVisualIds = useMemo(() => {
+    const hidden = new Set<string>();
+    for (const node of visibleRenderNodes) {
+      const clusterKey = clusterKeyByCommitId.get(node.commit.visualId);
+      if (!clusterKey || !closingClumps.has(clusterKey)) continue;
+      if (leadByClusterKey.get(clusterKey) === node.commit.visualId) continue;
+      hidden.add(node.commit.visualId);
+    }
+    return hidden;
+  }, [closingClumps, clusterKeyByCommitId, leadByClusterKey, visibleRenderNodes]);
 
   const adjustedAnchorByOriginalKey = useMemo(() => {
     const overrideKeys = Object.keys(nodePositionOverrides);
@@ -1188,16 +1236,7 @@ const MapGridCanvas = memo(function MapGridCanvas({
 
   const buildVisibleConnectors = useCallback(
     (
-      source: Array<{
-        id: string;
-        fromX: number;
-        fromY: number;
-        toX: number;
-        toY: number;
-        zIndex: number;
-        fromFace?: ConnectorFace;
-        toFace?: ConnectorFace;
-      }>,
+      source: Connector[],
       cull: (connector: {
         id: string;
         fromX: number;
@@ -1219,13 +1258,23 @@ const MapGridCanvas = memo(function MapGridCanvas({
   );
 
   const visibleMergeConnectors = useMemo(
-    () => buildVisibleConnectors(mergeConnectors, cullConnectorPath),
-    [mergeConnectors, cullConnectorPath, buildVisibleConnectors, cameraRenderTick],
+    () => buildVisibleConnectors(
+      mergeConnectors.filter((connector) =>
+        !optimisticallyHiddenVisualIds.has(connector.fromCommitVisualId ?? '')
+        && !optimisticallyHiddenVisualIds.has(connector.toCommitVisualId ?? '')),
+      cullConnectorPath,
+    ),
+    [mergeConnectors, cullConnectorPath, buildVisibleConnectors, cameraRenderTick, optimisticallyHiddenVisualIds],
   );
 
   const visibleConnectors = useMemo(
-    () => buildVisibleConnectors(connectors, cullConnectorPath),
-    [connectors, cullConnectorPath, buildVisibleConnectors, cameraRenderTick],
+    () => buildVisibleConnectors(
+      connectors.filter((connector) =>
+        !optimisticallyHiddenVisualIds.has(connector.fromCommitVisualId ?? '')
+        && !optimisticallyHiddenVisualIds.has(connector.toCommitVisualId ?? '')),
+      cullConnectorPath,
+    ),
+    [connectors, cullConnectorPath, buildVisibleConnectors, cameraRenderTick, optimisticallyHiddenVisualIds],
   );
 
   const connectorsForPathCache = useMemo(() => {
@@ -1313,9 +1362,11 @@ const MapGridCanvas = memo(function MapGridCanvas({
       const count = clusterCounts.get(clusterKey) ?? 1;
       if (count <= 1) continue;
       const isOpen =
-        renderedOpenClumps.has(clusterKey) ||
-        manuallyOpenedClumps.has(clusterKey) ||
-        (!defaultCollapsedClumps.has(clusterKey) && !manuallyClosedClumps.has(clusterKey));
+        !closingClumps.has(clusterKey) && !manuallyClosedClumps.has(clusterKey) && (
+          renderedOpenClumps.has(clusterKey) ||
+          manuallyOpenedClumps.has(clusterKey) ||
+          !defaultCollapsedClumps.has(clusterKey)
+        );
       if (!isOpen) {
         ids.add(node.commit.visualId);
       }
@@ -1324,6 +1375,7 @@ const MapGridCanvas = memo(function MapGridCanvas({
   }, [
     clusterKeyByCommitId,
     clusterCounts,
+    closingClumps,
     renderedOpenClumps,
     manuallyOpenedClumps,
     defaultCollapsedClumps,
@@ -1482,6 +1534,7 @@ const MapGridCanvas = memo(function MapGridCanvas({
                 manuallyOpenedClumps={manuallyOpenedClumps}
                 renderedOpenClumps={renderedOpenClumps}
                 manuallyClosedClumps={manuallyClosedClumps}
+                closingClumps={closingClumps}
                 defaultCollapsedClumps={defaultCollapsedClumps}
                 leadByClusterKey={leadByClusterKey}
                 firstByClusterKey={firstByClusterKey}
@@ -1505,7 +1558,11 @@ const MapGridCanvas = memo(function MapGridCanvas({
                 onClusterToggle={handleClusterToggle}
                 suppressSearchMatchScale={suppressSearchMatchScale}
                 animateClumpEntry={!isCameraMoving && isClumpMember && openingClumps.has(clusterKey)}
-                animateClumpExit={clusterKey != null && closingClumps.has(clusterKey)}
+                animateClumpExit={
+                  clusterKey != null
+                  && closingClumps.has(clusterKey)
+                  && leadByClusterKey.get(clusterKey) !== node.commit.visualId
+                }
                 clumpAnimationIndex={animationLayout?.entryIndex ?? 0}
                 clumpExitAnimationIndex={animationLayout?.exitIndex ?? 0}
                 reduceMotion={reduceMotion}

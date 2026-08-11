@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@cobble/tile-pattern-core':
-        specifier: workspace:*
+        specifier: file:packages/tile-pattern-core
         version: link:packages/tile-pattern-core
       '@tauri-apps/api':
         specifier: ^2
@@ -94,10 +94,10 @@ importers:
   apps/pattern-studio:
     dependencies:
       '@cobble/tile-pattern-core':
-        specifier: workspace:*
+        specifier: file:../../packages/tile-pattern-core
         version: link:../../packages/tile-pattern-core
       '@cobble/tile-pattern-export':
-        specifier: workspace:*
+        specifier: file:../../packages/tile-pattern-export
         version: link:../../packages/tile-pattern-export
       react:
         specifier: ^19.0.0
@@ -140,7 +140,7 @@ importers:
   packages/tile-pattern-export:
     dependencies:
       '@cobble/tile-pattern-core':
-        specifier: workspace:*
+        specifier: file:../tile-pattern-core
         version: link:../tile-pattern-core
     devDependencies:
       typescript:
