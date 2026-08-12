@@ -2426,6 +2426,7 @@ export default function BranchGridMap({
 
   useLayoutEffect(() => {
     if (renderNodes.length === 0) return;
+    if (!onMapReadyForDisplay) return;
     if (lastReadyEpochReportedRef.current === mapReadyEpoch) return;
     const rafId = window.requestAnimationFrame(() => {
       if (lastReadyEpochReportedRef.current === mapReadyEpoch) return;

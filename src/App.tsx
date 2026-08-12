@@ -61,6 +61,11 @@ import {
 } from './worktreeSignature';
 import { canApplyActiveRepoSnapshot } from './activeRepoGuard';
 import {
+  bumpLayoutEpochForRepo,
+  layoutCanFinishProjectLoad,
+  shouldRebuildLayoutAfterSnapshotApply,
+} from './layoutCachePolicy';
+import {
   shouldBlockIncomingSnapshotApply as shouldBlockIncomingSnapshotApplyGuard,
 } from './postCommitSnapshotGuard';
 import { consumeReloadSyncRequest } from './reloadIntercept';
@@ -82,7 +87,6 @@ import {
   worktreeStableKey,
   determineWorktreePromptDefaults,
 } from '../lib/worktreeSessions';
-import { deriveRepoVisualState } from './repoVisualState';
 import { setMapGridBackgroundActivity } from '../components/grid/mapGridBackgroundActivity';
 import { useWorktreeDraftMessages } from './useWorktreeDraftMessages';
 import { createRepoSyncScheduler } from './repoSyncScheduler';
@@ -563,6 +567,7 @@ function App() {
   const isFirstLoadSessionRef = useRef(true);
   const loadRepoRequestIdRef = useRef(0);
   const mapSwitchEpochRef = useRef(0);
+  const lastAppReadySignalRef = useRef<string | null>(null);
   const githubFetchRequestIdRef = useRef(0);
   const projectSnapshotSignatureRef = useRef<Record<string, string>>({});
   const activeSnapshotSignatureRef = useRef<string | null>(null);
@@ -648,8 +653,9 @@ function App() {
   const lastResolvedLayoutModelRef = useRef<BranchGridLayoutModel | null>(null);
   const [hydratedLayoutModel, setHydratedLayoutModel] = useState<BranchGridLayoutModel | null>(null);
   const [hydratedLayoutKey, setHydratedLayoutKey] = useState<string | null>(null);
-  /** Bumped when the working tree becomes clean so layout cache keys and MapGrid fully refresh. */
-  const [layoutEpoch, setLayoutEpoch] = useState(0);
+  const [settledLayoutLookupKey, setSettledLayoutLookupKey] = useState<string | null>(null);
+  /** Repo-scoped escape hatch for explicit redraws. Topology changes normally change the graph fingerprint. */
+  const [layoutEpochByRepo, setLayoutEpochByRepo] = useState<Record<string, number>>({});
   const activeRepoScopedKey = repoPath ?? '__no-repo__';
   const activeProject = useMemo(() => {
     return repoPath ? projects.find((project) => sameRepoPath(project.path, repoPath)) ?? null : null;
@@ -1538,115 +1544,6 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
     };
   }, [repoPath]);
 
-  useEffect(() => {
-    if (mapLoading || isRepoSwitchingRef.current) return;
-    if (projects.length === 0) return;
-    let isDisposed = false;
-
-    const hydrateProjectLayout = async (project: ProjectRecord, allowCompute: boolean) => {
-      const normalizedPath = normalizePath(project.path);
-      const snapshot = projectSnapshots[normalizedPath];
-      if (!snapshot?.loaded) return;
-      const projectOpenedClumps = manuallyOpenedGridClumpsByRepo[normalizedPath] ?? new Set<string>();
-      const projectClosedClumps = manuallyClosedGridClumpsByRepo[normalizedPath] ?? new Set<string>();
-      const layoutKey = makeLayoutCacheKey(
-        normalizedPath,
-        mapGridOrientation,
-        projectOpenedClumps,
-        projectClosedClumps,
-      );
-      if (layoutModelCacheRef.current.has(layoutKey)) return;
-      const payloadJson = await invoke<string | null>('get_repo_layout_snapshot', {
-        repoPath: normalizedPath,
-        layoutKey,
-      }).catch(() => null);
-      if (isDisposed) return;
-      if (payloadJson) {
-        try {
-          const parsed = JSON.parse(payloadJson);
-          const hydrated = hydrateBranchGridLayoutModel(parsed);
-          if (snapshot.branches.length > 0 && (hydrated.allCommits.length === 0 || hydrated.renderNodes.length === 0)) {
-            return;
-          }
-          layoutModelCacheRef.current.set(layoutKey, hydrated);
-          persistedLayoutKeysRef.current.add(layoutKey);
-          return;
-        } catch {
-          // fall through to recompute when persisted payload is invalid
-        }
-      }
-      if (!allowCompute) return;
-      const computedState = deriveRepoVisualState({
-        branches: snapshot.branches,
-        mergeNodes: snapshot.mergeNodes,
-        directCommits: snapshot.directCommits,
-        unpushedDirectCommits: snapshot.unpushedDirectCommits,
-        unpushedCommitShasByBranch: snapshot.unpushedCommitShasByBranch ?? {},
-        defaultBranch: snapshot.defaultBranch,
-        branchCommitPreviews: snapshot.branchCommitPreviews,
-        branchParentByName: snapshot.branchParentByName,
-        branchUniqueAheadCounts: snapshot.branchUniqueAheadCounts,
-        checkedOutRef: snapshot.checkedOutRef,
-        worktrees: snapshot.worktrees,
-        currentRepoPath: normalizedPath,
-        stashes: snapshot.stashes,
-        manuallyOpenedClumps: projectOpenedClumps,
-        manuallyClosedClumps: projectClosedClumps,
-        gridSearchQuery: '',
-        gridFocusSha: null,
-        orientation: mapGridOrientation,
-      });
-      const computedLayoutModel = computedState.sharedGridLayoutModel;
-      if (
-        (snapshot.branches.length > 0 || snapshot.directCommits.length > 0 || snapshot.unpushedDirectCommits.length > 0) &&
-        (computedLayoutModel.allCommits.length === 0 || computedLayoutModel.renderNodes.length === 0)
-      ) {
-        return;
-      }
-      layoutModelCacheRef.current.set(layoutKey, computedLayoutModel);
-      persistedLayoutKeysRef.current.add(layoutKey);
-      const serialized = JSON.stringify(serializeBranchGridLayoutModel(computedLayoutModel));
-      void invoke('store_repo_layout_snapshot', {
-        repoPath: normalizedPath,
-        layoutKey,
-        payloadJson: serialized,
-      }).catch(() => {
-        persistedLayoutKeysRef.current.delete(layoutKey);
-      });
-      await yieldToPaint();
-    };
-
-    void (async () => {
-      const activeProject = repoPath
-        ? projects.find((project) => sameRepoPath(project.path, repoPath))
-        : null;
-      const deferredProjects = activeProject
-        ? projects.filter((project) => !sameRepoPath(project.path, activeProject.path))
-        : projects;
-
-      if (activeProject) {
-        await hydrateProjectLayout(activeProject, false);
-      }
-      if (isDisposed) return;
-
-      for (const project of deferredProjects) {
-        if (isDisposed) return;
-        await hydrateProjectLayout(project, false);
-      }
-    })();
-    return () => {
-      isDisposed = true;
-    };
-  }, [
-    projects,
-    projectSnapshots,
-    mapGridOrientation,
-    manuallyOpenedGridClumpsByRepo,
-    manuallyClosedGridClumpsByRepo,
-    mapLoading,
-    repoPath,
-  ]);
-
   function persistProject(project: ProjectRecord) {
     setProjects((previous) => {
       const normalizedPath = normalizePath(project.path);
@@ -2078,7 +1975,14 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
     if (sameRepoPath(repoPath, normalizedPath)) {
       setHydratedLayoutModel(null);
       setHydratedLayoutKey(null);
+      setSettledLayoutLookupKey(null);
     }
+  }
+
+  function bumpRepoLayoutEpoch(path: string) {
+    const normalizedPath = normalizePath(path);
+    if (!normalizedPath) return;
+    setLayoutEpochByRepo((previous) => bumpLayoutEpochForRepo(previous, normalizedPath));
   }
 
   /** Drop cached layout/clumps and recompute the map from current React graph state. */
@@ -2087,7 +1991,7 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
     if (!normalizedPath) return;
     invalidateRepoLayoutCacheForPath(normalizedPath);
     lastResolvedLayoutModelRef.current = null;
-    setLayoutEpoch((epoch) => epoch + 1);
+    bumpRepoLayoutEpoch(normalizedPath);
   }
 
   async function syncCheckedOutRefFromQuickGitState(path: string) {
@@ -2200,7 +2104,7 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
         const live = getSnapshotForMutation(normalizedPath);
         if (snapshotContainsCommitSha(live, protectedSha)) {
           clearPostCommitProtectionForPath(normalizedPath);
-          setLayoutEpoch((epoch) => epoch + 1);
+          bumpRepoLayoutEpoch(normalizedPath);
           autoFocusSyncKeyRef.current = null;
           focusCameraOnActiveWorktreeRef.current?.();
           return;
@@ -2210,7 +2114,7 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
       }
     }
     if (!sameRepoPath(repoPath, normalizedPath)) return;
-    setLayoutEpoch((epoch) => epoch + 1);
+    bumpRepoLayoutEpoch(normalizedPath);
     autoFocusSyncKeyRef.current = null;
     gitActivityEpochRef.current += 1;
     void runRepoRefreshRef.current?.('graph').then(() => {
@@ -2840,6 +2744,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     lastResolvedLayoutModelRef.current = null;
     setHydratedLayoutModel(null);
     setHydratedLayoutKey(null);
+    setSettledLayoutLookupKey(null);
     setMapSwitchEpoch(nextEpoch);
     setMapReadyForDisplay(false);
     setMapPresentationState('loading');
@@ -2950,9 +2855,10 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     setMapGridBackgroundActivity('snapshot-apply', 'Apply repo snapshot', false);
     setMapGridBackgroundActivity('git-refresh-pending', 'Git refresh queued', false);
     const switchedProject = options?.allowProjectSwitch === true && isProjectSwitch;
-    if (options?.force === true && (options?.needsLayoutRebuild === true || switchedProject)) {
-      setLayoutEpoch((epoch) => epoch + 1);
+    if (shouldRebuildLayoutAfterSnapshotApply(options)) {
       redrawRepoGraph(path);
+    }
+    if (switchedProject || options?.needsLayoutRebuild === true) {
       void syncCheckedOutRefFromQuickGitState(path);
     }
 
@@ -3039,16 +2945,28 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     }
     if (cachedSnapshot?.loaded) {
       try {
-        await loadNodePositionsForRepo(normalizedPath);
+        const [, initialSyncTokens] = await Promise.all([
+          loadNodePositionsForRepo(normalizedPath),
+          invoke<RepoSyncTokens>('get_repo_sync_tokens', { repoPath: normalizedPath }).catch(() => null),
+        ]);
+        if (initialSyncTokens) {
+          repoSyncTokensRef.current = {
+            ...repoSyncTokensRef.current,
+            [normalizedPath]: initialSyncTokens,
+          };
+        }
         if (requestId !== loadRepoRequestIdRef.current) {
           return;
         }
         ensureMapSwitchStarted();
+        setProjectLoadStates((previous) => ({
+          ...previous,
+          [loadKey]: { status: 'loading', phase: 'Restoring map', progress: 95 },
+        }));
         const applied = applySnapshotToActiveState(normalizedPath, cachedSnapshot, {
           force: true,
           allowIncomingDirty: true,
           allowProjectSwitch: true,
-          needsLayoutRebuild: true,
         });
         if (!applied) {
           throw new Error(`Failed to apply cached snapshot for ${normalizedPath}`);
@@ -3066,10 +2984,6 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
           return;
         }
         setLoading(false);
-        setProjectLoadStates((previous) => ({
-          ...previous,
-          [loadKey]: { status: 'loading', phase: 'Building map', progress: 95 },
-        }));
         void fetchGitHubData(normalizedPath);
         void (async () => {
           if (requestId !== loadRepoRequestIdRef.current) return;
@@ -3081,7 +2995,6 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
           applySnapshotToActiveState(normalizedPath, refreshedSnapshot, {
             force: true,
             allowIncomingDirty: true,
-            needsLayoutRebuild: true,
           });
           finalizeProjectSwitchSnapshot(normalizedPath, refreshedSnapshot);
         })();
@@ -3131,11 +3044,24 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       if (requestId !== loadRepoRequestIdRef.current) {
         return;
       }
-      await loadNodePositionsForRepo(normalizedPath);
+      const [, initialSyncTokens] = await Promise.all([
+        loadNodePositionsForRepo(normalizedPath),
+        invoke<RepoSyncTokens>('get_repo_sync_tokens', { repoPath: normalizedPath }).catch(() => null),
+      ]);
+      if (initialSyncTokens) {
+        repoSyncTokensRef.current = {
+          ...repoSyncTokensRef.current,
+          [normalizedPath]: initialSyncTokens,
+        };
+      }
       if (requestId !== loadRepoRequestIdRef.current) {
         return;
       }
       ensureMapSwitchStarted();
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [loadKey]: { status: 'loading', phase: 'Building map', progress: 95 },
+      }));
       setRepoName(info.name);
       setDefaultBranch(def);
       upsertProjectSnapshot(normalizedPath, snapshot);
@@ -3170,10 +3096,6 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
         return;
       }
       setLoading(false); // unblock the landing button
-      setProjectLoadStates((previous) => ({
-        ...previous,
-        [loadKey]: { status: 'loading', phase: 'Building map', progress: 95 },
-      }));
 
       // Phase 3: GitHub data (non-blocking)
       void fetchGitHubData(normalizedPath);
@@ -3457,7 +3379,6 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       const applied = applySnapshotToActiveState(normalizedPath, snapshot, {
         force: true,
         allowIncomingDirty: true,
-        needsLayoutRebuild: true,
       });
       console.log('[repo-sync] graph snapshot', {
         applied,
@@ -5326,10 +5247,13 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     }
     return map;
   }, [branchesForLayout, defaultBranch]);
+  const activeLayoutEpoch = repoPath
+    ? (layoutEpochByRepo[normalizePath(repoPath)] ?? 0)
+    : 0;
   const graphLayoutSignature = useMemo(
     () =>
       buildGraphLayoutFingerprint({
-        layoutEpoch,
+        layoutEpoch: activeLayoutEpoch,
         defaultBranch,
         checkedOutBranch: visualCheckedOutRef?.branchName ?? '',
         checkedOutHead: visualCheckedOutRef?.headSha ?? '',
@@ -5344,7 +5268,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
           .join('|'),
       }),
     [
-      layoutEpoch,
+      activeLayoutEpoch,
       defaultBranch,
       visualCheckedOutRef?.branchName,
       visualCheckedOutRef?.headSha,
@@ -5434,12 +5358,14 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     if (!repoPath || !sharedGridLayoutCacheKey) {
       setHydratedLayoutModel(null);
       setHydratedLayoutKey(null);
+      setSettledLayoutLookupKey(null);
       return;
     }
     const normalizedRepoPath = normalizePath(repoPath);
     if (normalizedRepoPath && isPostCommitProtectionActive(normalizedRepoPath)) {
       setHydratedLayoutModel(null);
       setHydratedLayoutKey(null);
+      setSettledLayoutLookupKey(sharedGridLayoutCacheKey);
       return;
     }
     const hasWorktreeNodes = worktreeSessions.length > 0;
@@ -5448,6 +5374,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       if (layoutModelHasWorkingTree(inMemory) === hasWorktreeNodes) {
         setHydratedLayoutModel(inMemory);
         setHydratedLayoutKey(sharedGridLayoutCacheKey);
+        setSettledLayoutLookupKey(sharedGridLayoutCacheKey);
         persistedLayoutKeysRef.current.add(sharedGridLayoutCacheKey);
         return;
       }
@@ -5485,6 +5412,10 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
         if (disposed) return;
         setHydratedLayoutModel(null);
         setHydratedLayoutKey(null);
+      })
+      .finally(() => {
+        if (disposed) return;
+        setSettledLayoutLookupKey(sharedGridLayoutCacheKey);
       });
     return () => {
       disposed = true;
@@ -5526,7 +5457,11 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
         ...previous,
         [key]: {
           status: 'loading',
-          phase: status.processedItems > 0 ? 'Expanding map' : 'Building map',
+          phase: status.source === 'cache'
+            ? 'Restoring map'
+            : status.processedItems > 0
+              ? 'Expanding map'
+              : 'Building map',
           progress: Math.min(99, 95 + Math.floor(progressRatio * 4)),
         },
       }));
@@ -5557,6 +5492,9 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     sharedGridLayoutCacheKey,
     hydratedLayoutModel,
     hydratedLayoutKey,
+    layoutCacheLookupPending: Boolean(
+      sharedGridLayoutCacheKey && settledLayoutLookupKey !== sharedGridLayoutCacheKey
+    ),
     mapLoading,
     layoutModelCacheRef,
     onStatusChange: handleBranchGridLayoutStatus,
@@ -5786,6 +5724,13 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     finishSidebarDrag('pointercancel', event.pointerId);
   };
 
+  const currentLayoutCanFinishProjectLoad = layoutCanFinishProjectLoad({
+    isCurrent: sharedGridLayoutIsCurrent,
+    isComplete: sharedGridLayoutIsComplete,
+    status: mapLayoutStatus.state,
+    isPartial: mapLayoutStatus.isPartial,
+  });
+
   const handleMapReadyForDisplay = useCallback((epoch: number) => {
     if (epoch !== mapSwitchEpochRef.current) return;
     finishMapSwitch(epoch, 'ready');
@@ -5797,6 +5742,30 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       [key]: { status: 'ready', phase: 'Ready', progress: 100 },
     }));
   }, []);
+
+  useEffect(() => {
+    if (!repoPath) return;
+    if (!currentLayoutCanFinishProjectLoad) return;
+
+    const readySignal = `${normalizePath(repoPath)}::${mapSwitchEpoch}`;
+    if (lastAppReadySignalRef.current === readySignal) return;
+    let secondFrameId: number | null = null;
+    const firstFrameId = window.requestAnimationFrame(() => {
+      secondFrameId = window.requestAnimationFrame(() => {
+        lastAppReadySignalRef.current = readySignal;
+        handleMapReadyForDisplay(mapSwitchEpoch);
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrameId);
+      if (secondFrameId != null) window.cancelAnimationFrame(secondFrameId);
+    };
+  }, [
+    handleMapReadyForDisplay,
+    currentLayoutCanFinishProjectLoad,
+    mapSwitchEpoch,
+    repoPath,
+  ]);
 
   const runPreviewForTarget = useCallback(async (
     target: PreviewTarget,
@@ -6738,7 +6707,9 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
                 blockMapDisplay={blockMapDisplay}
                 blockMapInteraction={blockMapInteraction}
                 mapReadyEpoch={mapSwitchEpoch}
-                onMapReadyForDisplay={handleMapReadyForDisplay}
+                onMapReadyForDisplay={
+                  currentLayoutCanFinishProjectLoad ? handleMapReadyForDisplay : undefined
+                }
                 onGridSearchResultCountChange={setGridSearchResultCount}
                 onGridSearchResultIndexChange={setGridSearchResultIndex}
                 onGridSearchFocusChange={handleGridFocusChange}
@@ -6800,7 +6771,9 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
                 <div className="pointer-events-none absolute inset-x-0 bottom-5 z-[130] flex justify-center px-4">
                   <div className="pointer-events-auto flex items-center gap-3 rounded-xl border border-border bg-card/80 px-3 py-2 text-xs text-muted-foreground shadow-sm backdrop-blur-sm">
                     <span>
-                      {mapLayoutStatus.processedItems > 0
+                      {mapLayoutStatus.source === 'cache'
+                        ? 'Restoring saved map'
+                        : mapLayoutStatus.processedItems > 0
                         ? `Expanding map: ${mapLayoutStatus.processedItems.toLocaleString()} of ${mapLayoutStatus.totalItems.toLocaleString()} items`
                         : `Building map for ${mapLayoutStatus.totalItems.toLocaleString()} items`}
                     </span>
@@ -6826,7 +6799,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
                         beginMapSwitch();
                         isRepoSwitchingRef.current = true;
                         setMapLoading(true);
-                        setLayoutEpoch((epoch) => epoch + 1);
+                        if (repoPath) bumpRepoLayoutEpoch(repoPath);
                       }}
                       className="rounded-lg px-2 py-1 text-foreground transition-colors hover:bg-muted"
                     >
@@ -6868,7 +6841,7 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
                           beginMapSwitch();
                           isRepoSwitchingRef.current = true;
                           setMapLoading(true);
-                          setLayoutEpoch((epoch) => epoch + 1);
+                          bumpRepoLayoutEpoch(repoPath);
                         }}
                         className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted"
                       >

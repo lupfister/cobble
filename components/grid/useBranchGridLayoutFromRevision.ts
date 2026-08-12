@@ -106,6 +106,11 @@ export const layoutModelMatchesManualClumpState = (
   return true;
 };
 
+export const layoutComputationWaitsForCache = (
+  source: LayoutResolveSource,
+  layoutCacheLookupPending: boolean,
+): boolean => source === 'needs-compute' && layoutCacheLookupPending;
+
 export type BranchGridLayoutStatus = {
   state: 'idle' | 'computing' | 'ready' | 'error';
   source: 'none' | 'cache' | 'worker' | 'main-small';
@@ -202,6 +207,7 @@ export const useBranchGridLayoutFromRevision = (params: {
   sharedGridLayoutCacheKey: string | null;
   hydratedLayoutModel: BranchGridLayoutModel | null;
   hydratedLayoutKey: string | null;
+  layoutCacheLookupPending: boolean;
   mapLoading: boolean;
   layoutModelCacheRef: MutableRefObject<Map<string, BranchGridLayoutModel>>;
   onStatusChange?: (status: BranchGridLayoutStatus) => void;
@@ -211,6 +217,7 @@ export const useBranchGridLayoutFromRevision = (params: {
     sharedGridLayoutCacheKey,
     hydratedLayoutModel,
     hydratedLayoutKey,
+    layoutCacheLookupPending,
     mapLoading,
     layoutModelCacheRef,
     onStatusChange,
@@ -277,6 +284,22 @@ export const useBranchGridLayoutFromRevision = (params: {
         totalItems: nodeEstimate,
         isPartial: false,
         durationMs: 0,
+        error: null,
+        cappedReason: null,
+      });
+      return undefined;
+    }
+
+    if (layoutComputationWaitsForCache(resolved.source, layoutCacheLookupPending)) {
+      setAsyncLayout(null);
+      onStatusChange?.({
+        state: 'computing',
+        source: 'cache',
+        nodeEstimate,
+        processedItems: 0,
+        totalItems: nodeEstimate,
+        isPartial: false,
+        durationMs: null,
         error: null,
         cappedReason: null,
       });
@@ -431,7 +454,15 @@ export const useBranchGridLayoutFromRevision = (params: {
       });
     }, 0);
     return () => window.clearTimeout(fallbackId);
-  }, [layoutComputeKey, resolved.source, resolved.model, layoutInput, nodeEstimate, onStatusChange]);
+  }, [
+    layoutCacheLookupPending,
+    layoutComputeKey,
+    resolved.source,
+    resolved.model,
+    layoutInput,
+    nodeEstimate,
+    onStatusChange,
+  ]);
 
   const currentAsyncLayout = asyncLayout?.computeKey === layoutComputeKey ? asyncLayout : null;
   const asyncLayoutModel = currentAsyncLayout?.model ?? null;

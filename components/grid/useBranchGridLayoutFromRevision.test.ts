@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { BranchGridLayoutModel } from './branchGridLayoutModel';
-import { layoutModelMatchesManualClumpState } from './useBranchGridLayoutFromRevision';
+import {
+  layoutComputationWaitsForCache,
+  layoutModelMatchesManualClumpState,
+} from './useBranchGridLayoutFromRevision';
 
 const CLUSTER_KEY = 'cluster:feature:segment:1';
 
@@ -38,5 +41,20 @@ describe('layoutModelMatchesManualClumpState', () => {
       new Set([CLUSTER_KEY]),
       new Set(),
     )).toBe(false);
+  });
+});
+
+describe('layout cache lookup policy', () => {
+  it('waits for persisted cache hydration before starting a layout job', () => {
+    expect(layoutComputationWaitsForCache('needs-compute', true)).toBe(true);
+  });
+
+  it('starts a layout job after a cache miss settles', () => {
+    expect(layoutComputationWaitsForCache('needs-compute', false)).toBe(false);
+  });
+
+  it('serves an available cache without waiting', () => {
+    expect(layoutComputationWaitsForCache('hydrated', true)).toBe(false);
+    expect(layoutComputationWaitsForCache('memory', true)).toBe(false);
   });
 });
