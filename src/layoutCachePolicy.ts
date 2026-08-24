@@ -28,5 +28,5 @@ export function layoutCanFinishProjectLoad(input: {
 }): boolean {
   if (!input.isCurrent) return false;
   if (input.status !== 'ready') return false;
-  return input.isComplete || input.isPartial;
+  return input.isComplete && !input.isPartial;
 }

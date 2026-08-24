@@ -297,6 +297,7 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     expect(tipNode).toBeDefined();
     expect(placeholderNode!.row).toBeGreaterThan(forkNode!.row);
     expect(placeholderNode!.column).toBeGreaterThan(forkNode!.column);
+    expect(tipNode!.row).toBeGreaterThan(forkNode!.row);
     expect(tipNode!.row).toBe(placeholderNode!.row);
     expect(placeholderNode!.commit.date).toBe(forkNode!.commit.date);
   });
@@ -511,7 +512,7 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     );
   });
 
-  it('assigns open clump members to contiguous columns owned by the lead', () => {
+  it('assigns open clump members to contiguous parent-first columns', () => {
     const defaultBranch = 'main';
     const unpushedA = 'cccccccccccccccccccccccccccccccccccccccc';
     const unpushedB = 'dddddddddddddddddddddddddddddddddddddddd';
@@ -632,7 +633,7 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     expect(leadNode!.x).toBe(firstNode!.x);
   });
 
-  it('places open horizontal clump lanes oldest at top and newest at bottom without sharing cells', () => {
+  it('keeps the collapsed clump card in place and reveals members below it', () => {
     const defaultBranch = 'main';
     const unpushedA = 'cccccccccccccccccccccccccccccccccccccccc';
     const unpushedB = 'dddddddddddddddddddddddddddddddddddddddd';
@@ -730,10 +731,14 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     const firstNode = clumpNodes.find((node) => node.commit.visualId === firstVisualId);
     expect(leadNode).toBeDefined();
     expect(firstNode).toBeDefined();
+    const collapsedClumpNode = collapsed.renderNodes.find(
+      (node) => collapsed.clusterKeyByCommitId.get(node.commit.visualId) === clusterKey,
+    )!;
     const bandStartColumn = firstNode!.column;
     expect(new Set(clumpNodes.map((node) => node.column))).toEqual(
       new Set([bandStartColumn, bandStartColumn + 1, bandStartColumn + 2]),
     );
+    expect(firstNode!.column).toBe(collapsedClumpNode.column);
     expect(leadNode!.column).toBe(bandStartColumn + 2);
     expect(leadNode!.y).toBeGreaterThan(firstNode!.y);
     const chronologicalNodes = [...clumpNodes].sort(
@@ -751,9 +756,6 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     expect(new Set(clumpNodes.map((node) => node.x)).size).toBe(1);
     expect(new Set(clumpNodes.map((node) => node.y)).size).toBe(3);
 
-    const collapsedClumpNode = collapsed.renderNodes.find(
-      (node) => collapsed.clusterKeyByCommitId.get(node.commit.visualId) === clusterKey,
-    )!;
     const lanePitch = ROW_HEIGHT + ROW_GAP / GRID_LAYOUT_RENDER_ZOOM + 20 / GRID_LAYOUT_RENDER_ZOOM;
     const movedOwnerColumn = collapsedClumpNode.column + 4;
     const movedOrigin = {
@@ -785,12 +787,12 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     const movedLeadNode = movedClumpNodes.find(
       (node) => node.commit.visualId === movedOpened.leadByClusterKey.get(clusterKey!),
     )!;
-    expect(movedFirstNode.column).not.toBe(movedOwnerColumn);
+    expect(movedFirstNode.column).toBe(collapsedClumpNode.column);
     expect(movedLeadNode.column).toBe(movedFirstNode.column + movedClumpNodes.length - 1);
     expect(movedLeadNode.y).toBeGreaterThan(movedFirstNode.y);
   });
 
-  it('keeps sibling clump lanes stable when another clump opens', () => {
+  it('keeps sibling lanes stable when an opened clump reveals reserved lanes', () => {
     const defaultBranch = 'main';
     const primaryA = '1111111111111111111111111111111111111111';
     const primaryB = '2222222222222222222222222222222222222222';
@@ -915,7 +917,22 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
       (node) => opened.clusterKeyByCommitId.get(node.commit.visualId) === siblingClusterKey,
     );
     expect(openedSiblingNode).toBeDefined();
-    expect(openedSiblingNode!.column).toBe(closedSiblingNode!.column);
+    const closedNodeByVisualId = new Map(
+      closed.renderNodes.map((node) => [node.commit.visualId, node] as const),
+    );
+    for (const node of opened.renderNodes) {
+      if (opened.clusterKeyByCommitId.get(node.commit.visualId) === primaryClusterKey) continue;
+      const closedNode = closedNodeByVisualId.get(node.commit.visualId);
+      if (!closedNode) continue;
+      expect(node.row, `${node.commit.visualId} changed timeline columns`).toBe(closedNode.row);
+    }
+
+    const bothOpened = computeBranchGridLayout({
+      ...baseInput,
+      manuallyOpenedClumps: new Set([primaryClusterKey!, siblingClusterKey!]),
+    });
+    const occupiedCells = bothOpened.renderNodes.map((node) => `${node.row}:${node.column}`);
+    expect(new Set(occupiedCells).size).toBe(occupiedCells.length);
   });
 
   it('does not let an opened clump member predate and reorder a sibling clump', () => {
@@ -1633,7 +1650,7 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     expect(stashNode!.column).toBeLessThan(maxColumn);
   });
 
-  it('places fork children of the same parent on one timeline row', () => {
+  it('places fork children of the same parent in one timeline column', () => {
     const defaultBranch = 'main';
     const forkSha = 'be7d231be7d231be7d231be7d231be7d231be7';
     const mainChildSha = '5dcf2515dcf2515dcf2515dcf2515dcf2515';
@@ -1723,12 +1740,19 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     expect(cursorOneNode).toBeDefined();
     expect(cursorTwoNode).toBeDefined();
     expect(mainChildNode!.row).toBeGreaterThan(forkNode!.row);
-    expect(mainChildNode!.row).toBe(cursorOneNode!.row);
-    expect(mainChildNode!.row).toBe(cursorTwoNode!.row);
+    expect(mainChildNode!.row).toBe(forkNode!.row + 1);
+    expect(cursorOneNode!.row).toBe(forkNode!.row + 1);
+    expect(cursorTwoNode!.row).toBe(forkNode!.row + 1);
     expect(new Set([mainChildNode!.column, cursorOneNode!.column, cursorTwoNode!.column]).size).toBe(3);
+    const childColumns = [
+      mainChildNode!.column,
+      cursorOneNode!.column,
+      cursorTwoNode!.column,
+    ].sort((left, right) => left - right);
+    expect(childColumns[2]! - childColumns[0]!).toBe(2);
   });
 
-  it('places fork children on one row when fork tips differ in timestamp', () => {
+  it('keeps fork children in one timeline column when timestamps differ', () => {
     const defaultBranch = 'main';
     const forkSha = 'be7d231be7d231be7d231be7d231be7d231be7';
     const mainChildSha = 'ac3ddcaac3ddcaac3ddcaac3ddcaac3ddcaac3';
@@ -1812,11 +1836,12 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
     expect(cursorOneNode).toBeDefined();
     expect(cursorTwoNode).toBeDefined();
     expect(mainChildNode!.row).toBeGreaterThan(forkNode!.row);
-    expect(mainChildNode!.row).toBe(cursorOneNode!.row);
-    expect(mainChildNode!.row).toBe(cursorTwoNode!.row);
+    expect(mainChildNode!.row).toBe(forkNode!.row + 1);
+    expect(cursorOneNode!.row).toBe(forkNode!.row + 1);
+    expect(cursorTwoNode!.row).toBe(forkNode!.row + 1);
   });
 
-  it('forms clumps based on user/author', () => {
+  it('keeps connected commits in one clump across author changes', () => {
     const defaultBranch = 'main';
     const branches = [
       makeBranch(defaultBranch, tipSha, 1),
@@ -1898,35 +1923,67 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
       orientation: 'horizontal',
     });
 
-    // Check cluster counts
-    // 'sha1', 'sha2', and 'sha3' are on 'feature' branch.
-    // Since they have different authors (Alice, Bob, Alice), they should NOT group into a single cluster.
-    // Instead, they should be in separate clusters (of count 1).
     const key1 = layout.clusterKeyByCommitId.get('feature:sha1');
     const key2 = layout.clusterKeyByCommitId.get('feature:sha2');
     const key3 = layout.clusterKeyByCommitId.get('feature:sha3');
 
     expect(key1).toBeDefined();
-    expect(key2).toBeDefined();
-    expect(key3).toBeDefined();
-    expect(key1).not.toBe(key2);
-    expect(key2).not.toBe(key3);
-    expect(key1).not.toBe(key3);
+    expect(key1).toBe(key2);
+    expect(key1).toBe(key3);
+  });
 
-    // Let's verify that if they had the same author, they would clump
-    const unpushedSameAuthor = unpushedDirectCommits.map(c => ({ ...c, author: 'Alice' }));
-    const layoutSame = computeBranchGridLayout({
-      branches,
+  it('keeps equal-time commits in parent-first clump order', () => {
+    const defaultBranch = 'main';
+    const parentSha = 'ca184f3000000000000000000000000000000000';
+    const childSha = '0d14059000000000000000000000000000000000';
+    const sharedDate = '2026-08-05T14:46:00Z';
+    const layout = computeBranchGridLayout({
+      branches: [
+        makeBranch(defaultBranch, tipSha, 1),
+        makeBranch('sync/peter-main-2026-08-12', childSha, 2, defaultBranch),
+      ],
       mergeNodes: [],
-      directCommits,
-      unpushedDirectCommits: unpushedSameAuthor,
+      directCommits: [
+        {
+          fullSha: tipSha,
+          sha: tipSha.slice(0, 7),
+          branch: defaultBranch,
+          message: 'main tip',
+          author: 'dev',
+          date: '2026-08-05T14:45:00Z',
+          parentSha: null,
+          parentShas: [],
+        },
+      ],
+      unpushedDirectCommits: [
+        {
+          fullSha: parentSha,
+          sha: parentSha.slice(0, 7),
+          branch: 'sync/peter-main-2026-08-12',
+          message: 'provision an org and seat its first admin',
+          author: 'hieu-cell',
+          date: sharedDate,
+          parentSha: tipSha,
+          parentShas: [tipSha],
+        },
+        {
+          fullSha: childSha,
+          sha: childSha.slice(0, 7),
+          branch: 'sync/peter-main-2026-08-12',
+          message: 'heal the identity sequence before provisioning',
+          author: 'hieu-cell',
+          date: sharedDate,
+          parentSha,
+          parentShas: [parentSha],
+        },
+      ],
       unpushedCommitShasByBranch: {
-        feature: ['sha1', 'sha2', 'sha3'],
+        'sync/peter-main-2026-08-12': [parentSha, childSha],
       },
       defaultBranch,
-      branchCommitPreviews: { main: [], feature: [] },
-      branchParentByName: { main: null, feature: 'main' },
-      branchUniqueAheadCounts: { main: 1, feature: 3 },
+      branchCommitPreviews: { main: [], 'sync/peter-main-2026-08-12': [] },
+      branchParentByName: { main: null, 'sync/peter-main-2026-08-12': 'main' },
+      branchUniqueAheadCounts: { main: 1, 'sync/peter-main-2026-08-12': 2 },
       manuallyClosedClumps: new Set(),
       manuallyOpenedClumps: new Set(),
       isDebugOpen: false,
@@ -1936,13 +1993,10 @@ describe('computeBranchGridLayout empty branch placeholders', () => {
       orientation: 'horizontal',
     });
 
-    const keySame1 = layoutSame.clusterKeyByCommitId.get('feature:sha1');
-    const keySame2 = layoutSame.clusterKeyByCommitId.get('feature:sha2');
-    const keySame3 = layoutSame.clusterKeyByCommitId.get('feature:sha3');
-
-    expect(keySame1).toBeDefined();
-    expect(keySame1).toBe(keySame2);
-    expect(keySame1).toBe(keySame3);
+    const parentKey = layout.clusterKeyByCommitId.get(`sync/peter-main-2026-08-12:${parentSha}`);
+    const childKey = layout.clusterKeyByCommitId.get(`sync/peter-main-2026-08-12:${childSha}`);
+    expect(parentKey).toBeDefined();
+    expect(parentKey).toBe(childKey);
   });
 
   it('renders remote-only branch commit from previews when directCommits are missing', () => {

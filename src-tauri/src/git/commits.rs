@@ -225,6 +225,7 @@ pub fn get_all_repo_commits(
     default_branch: &str,
     other_branches: &[String],
     branch_created_dates: &HashMap<String, String>,
+    branch_parent_by_name: &HashMap<String, String>,
     merge_target_branch_by_commit_sha: &HashMap<String, String>,
 ) -> Result<Vec<DirectCommit>, GitError> {
     let mut refs: Vec<String> = std::iter::once(default_branch.to_string())
@@ -356,8 +357,19 @@ pub fn get_all_repo_commits(
         let Some(b_head) = head_sha_by_branch.get(b_name) else {
             continue;
         };
+        if let Some(parent_name) = branch_parent_by_name.get(b_name) {
+            if first_parent_distance_by_commit_sha_and_branch
+                .contains_key(&(b_head.clone(), parent_name.clone()))
+            {
+                disabled_branches.insert(b_name.clone());
+                continue;
+            }
+        }
         for (a_index, a_name) in branch_order.iter().enumerate() {
             if a_name == b_name {
+                continue;
+            }
+            if disabled_branches.contains(a_name) {
                 continue;
             }
             if !head_sha_by_branch.contains_key(a_name) {
@@ -801,6 +813,7 @@ mod branch_assignment_tests {
             &["main".to_string(), "other".to_string()],
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         )
         .expect("load commits");
 
@@ -828,6 +841,7 @@ mod branch_assignment_tests {
             &repo.path,
             "main",
             &["main".to_string(), "other".to_string()],
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         )
@@ -864,6 +878,7 @@ mod branch_assignment_tests {
             &["main".to_string(), "other".to_string()],
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         )
         .expect("load commits");
 
@@ -884,7 +899,10 @@ mod branch_assignment_tests {
         let mut branch_dates = HashMap::new();
         branch_dates.insert("main".to_string(), "2024-01-01T00:00:00Z".to_string());
         branch_dates.insert("branch-a".to_string(), "2024-01-02T00:00:00Z".to_string());
-        branch_dates.insert("branch-b".to_string(), "2024-01-03T00:00:00Z".to_string());
+        // A missing reflog can make the new branch date look older than its
+        // parent commit. Parent ownership must still win.
+        branch_dates.insert("branch-b".to_string(), "2023-01-01T00:00:00Z".to_string());
+        let branch_parents = HashMap::from([("branch-b".to_string(), "branch-a".to_string())]);
 
         let commits = get_all_repo_commits(
             &repo.path,
@@ -895,6 +913,7 @@ mod branch_assignment_tests {
                 "branch-b".to_string(),
             ],
             &branch_dates,
+            &branch_parents,
             &HashMap::new(),
         )
         .expect("load commits");
@@ -932,6 +951,7 @@ mod branch_assignment_tests {
                 "branch-b".to_string(),
             ],
             &branch_dates,
+            &HashMap::new(),
             &HashMap::new(),
         )
         .expect("load commits");
@@ -1335,7 +1355,14 @@ mod remote_merge_tests {
         let branch_name = "cursor/commit-app-previews-7896";
         let upstream_ref = format!("origin/{branch_name}");
         let mut commits =
-            get_all_repo_commits(&repo, default_branch, &[], &HashMap::new(), &HashMap::new())
+            get_all_repo_commits(
+                &repo,
+                default_branch,
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
                 .expect("local commits");
 
         merge_remote_only_branch_commits(

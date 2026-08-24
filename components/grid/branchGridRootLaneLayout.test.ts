@@ -32,12 +32,17 @@ describe('computeBranchGridLayout root lane assignment', () => {
       const childClusterKey = layout.clusterKeyByCommitId.get(child!.commit.visualId);
       if (parentClusterKey && parentClusterKey === childClusterKey) {
         expect(child!.row).toBe(parent!.row);
+        expect(child!.column).toBeGreaterThan(parent!.column);
       } else {
         expect(child!.row).toBeGreaterThan(parent!.row);
+        expect(child!.column).toBeGreaterThan(parent!.column);
       }
-      expect(child!.column).toBeGreaterThan(parent!.column);
       expect(child!.x).toBeGreaterThanOrEqual(parent!.x);
-      expect(child!.y).toBeGreaterThan(parent!.y);
+      if (parentClusterKey && parentClusterKey === childClusterKey) {
+        expect(child!.y).toBeGreaterThan(parent!.y);
+      } else {
+        expect(child!.y).toBeGreaterThan(parent!.y);
+      }
     }
   };
 
@@ -98,15 +103,15 @@ describe('computeBranchGridLayout root lane assignment', () => {
       orientation: 'horizontal',
     });
 
-    const mainRoot = layout.nodes.find((node) => node.commit.id === rootA);
-    const orphanRoot = layout.nodes.find((node) => node.commit.id === rootB);
-    expect(mainRoot).toBeDefined();
+    const mainNode = layout.renderNodes.find((node) => node.commit.branchName === defaultBranch);
+    const orphanRoot = layout.renderNodes.find((node) => node.commit.id === rootB);
+    expect(mainNode).toBeDefined();
     expect(orphanRoot).toBeDefined();
-    expect(orphanRoot!.column).toBeGreaterThan(mainRoot!.column);
+    expect(orphanRoot!.column).not.toBe(mainNode!.column);
     expectEveryConnectorRightAndDown(layout);
   });
 
-  it('keeps an overridden child out of its parent visual column', () => {
+  it('keeps a same-branch clump override anchored while opening below it', () => {
     const defaultBranch = 'main';
     const branches = [makeBranch(defaultBranch, childOnA)];
     const directCommits: DirectCommit[] = [
@@ -140,7 +145,7 @@ describe('computeBranchGridLayout root lane assignment', () => {
       branchCommitPreviews: { main: [] },
       branchParentByName: { main: null },
       branchUniqueAheadCounts: { main: 1 },
-      manuallyOpenedClumps: new Set(),
+      manuallyOpenedClumps: new Set([`cluster:main:start:${rootA}`]),
       manuallyClosedClumps: new Set(),
       isDebugOpen: false,
       gridSearchQuery: '',
@@ -154,7 +159,8 @@ describe('computeBranchGridLayout root lane assignment', () => {
 
     const parent = layout.renderNodes.find((node) => node.commit.id === rootA)!;
     const child = layout.renderNodes.find((node) => node.commit.id === childOnA)!;
-    expect(child.x).toBeGreaterThan(parent.x);
+    expect(child.column).toBeGreaterThan(parent.column);
+    expect(child.y).toBeGreaterThan(parent.y);
     expectEveryConnectorRightAndDown(layout);
   });
 });

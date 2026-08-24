@@ -39,7 +39,7 @@ describe('snapshot layout cache policy', () => {
       isComplete: false,
       status: 'ready',
       isPartial: true,
-    })).toBe(true);
+    })).toBe(false);
     expect(layoutCanFinishProjectLoad({
       isCurrent: false,
       isComplete: true,

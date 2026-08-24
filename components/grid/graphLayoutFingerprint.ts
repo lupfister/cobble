@@ -23,7 +23,7 @@ export const buildGraphLayoutFingerprint = (parts: {
   mergeNodesSignature: string;
 }): string =>
   [
-    'layout-v15-fingerprint',
+    'layout-v30-fingerprint',
     parts.layoutEpoch,
     parts.defaultBranch,
     parts.checkedOutBranch,

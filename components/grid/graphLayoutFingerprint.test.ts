@@ -22,7 +22,7 @@ describe('graphLayoutFingerprint', () => {
       unpushedCommitFingerprint: '0:0',
       mergeNodesSignature: '',
     });
-    expect(fingerprint).toContain('layout-v15-fingerprint');
+    expect(fingerprint).toContain('layout-v30-fingerprint');
     expect(fingerprint).toContain('main');
   });
 });

@@ -517,7 +517,7 @@ describe('computeBranchGridLayout worktree nodes', () => {
     expect(latestNode).toBeDefined();
     expect(worktreeNode).toBeDefined();
     expect(worktreeNode!.row).toBe(latestNode!.row + 1);
-    expect(worktreeNode!.column).not.toBe(latestNode!.column);
+    expect(worktreeNode!.column).toBe(latestNode!.column + 1);
     expect(
       opened.connectors.some(
         (connector) =>
@@ -565,6 +565,11 @@ describe('computeBranchGridLayout worktree nodes', () => {
       .map((node) => node.column);
     expect(movedLatestNode).toBeDefined();
     expect(movedLatestNode!.column).toBe(Math.max(...movedClumpColumns));
+    const movedWorktreeNode = movedOpened.renderNodes.find(
+      (node) => node.commit.id === sessions[0]!.workingTreeId,
+    );
+    expect(movedWorktreeNode).toBeDefined();
+    expect(movedWorktreeNode!.column).toBeGreaterThan(Math.max(...movedClumpColumns));
   });
 
   it('treats a cross-lane worktree attachment as a clump edge on the parent commit', () => {

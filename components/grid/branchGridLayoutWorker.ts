@@ -1,11 +1,7 @@
 /// <reference lib="webworker" />
 import { computeBranchGridLayout, type BranchGridLayoutInput } from './branchGridLayoutModel';
 import { serializeBranchGridLayoutModel, type SerializedBranchGridLayoutModel } from './layoutSnapshot';
-import {
-  estimateBranchGridLayoutItems,
-  progressiveBranchGridLayoutLimits,
-  sliceBranchGridLayoutInput,
-} from './progressiveBranchGridLayout';
+import { estimateBranchGridLayoutItems } from './progressiveBranchGridLayout';
 
 export type WorkerBranchGridLayoutInput = Omit<
   BranchGridLayoutInput,
@@ -51,30 +47,19 @@ self.onmessage = (event: MessageEvent<BranchGridLayoutWorkerRequest>) => {
       isDebugOpen: false,
     };
     const totalItems = estimateBranchGridLayoutItems(normalizedInput);
-    const limits = progressiveBranchGridLayoutLimits(totalItems);
-    for (const [index, processedItems] of limits.entries()) {
-      const stageStartedAt = performance.now();
-      const complete = processedItems >= totalItems;
-      const stageInput = complete
-        ? normalizedInput
-        : sliceBranchGridLayoutInput(normalizedInput, processedItems);
-      const model = computeBranchGridLayout(stageInput);
-      const stageDurationMs = performance.now() - stageStartedAt;
-      const capped = !complete && stageDurationMs >= 4_000;
-      const response: BranchGridLayoutWorkerSuccess = {
-        jobId,
-        ok: true,
-        serialized: serializeBranchGridLayoutModel(model),
-        complete,
-        capped,
-        processedItems,
-        totalItems,
-        stageIndex: index + 1,
-        stageCount: limits.length,
-      };
-      self.postMessage(response);
-      if (complete || capped) break;
-    }
+    const model = computeBranchGridLayout(normalizedInput);
+    const response: BranchGridLayoutWorkerSuccess = {
+      jobId,
+      ok: true,
+      serialized: serializeBranchGridLayoutModel(model),
+      complete: true,
+      capped: false,
+      processedItems: totalItems,
+      totalItems,
+      stageIndex: 1,
+      stageCount: 1,
+    };
+    self.postMessage(response);
   } catch (error) {
     const response: BranchGridLayoutWorkerFailure = {
       jobId,

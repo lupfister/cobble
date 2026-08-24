@@ -15,7 +15,11 @@ export type ApplyNodePositionOverridesInput = {
   maxResolvedRow?: number;
 };
 
-type ClusterDragAnchor = { node: Node };
+type ClusterDragAnchor = {
+  node: Node;
+  originalRow: number;
+  originalColumn: number;
+};
 
 const layoutIndicesForLogicalOverride = (
   override: NodePositionOverrides[string],
@@ -39,7 +43,7 @@ export const applyNodePositionOverrides = ({
   leadByClusterKey,
   rowByVisualId,
   overrides,
-  isHorizontal,
+  isHorizontal: _isHorizontal,
 }: ApplyNodePositionOverridesInput): Set<string> => {
   const pinnedNodeVisualIds = new Set<string>();
   const bestOverrideByClusterKey = new Map<string, { override: NodePositionOverrides[string]; row: number }>();
@@ -91,9 +95,11 @@ export const applyNodePositionOverrides = ({
     if (directOverride) {
       const indices = layoutIndicesForLogicalOverride(directOverride);
       if (!indices) continue;
+      const originalRow = node.row;
+      const originalColumn = node.column;
       node.row = indices.row;
       node.column = indices.column;
-      clusterDragAnchorByKey.set(clusterKey, { node });
+      clusterDragAnchorByKey.set(clusterKey, { node, originalRow, originalColumn });
       pinnedNodeVisualIds.add(node.commit.visualId);
       continue;
     }
@@ -102,9 +108,11 @@ export const applyNodePositionOverrides = ({
     if (!inherited) continue;
     const indices = layoutIndicesForLogicalOverride(inherited.override);
     if (!indices) continue;
+    const originalRow = node.row;
+    const originalColumn = node.column;
     node.row = indices.row;
     node.column = indices.column;
-    clusterDragAnchorByKey.set(clusterKey, { node });
+    clusterDragAnchorByKey.set(clusterKey, { node, originalRow, originalColumn });
     pinnedNodeVisualIds.add(node.commit.visualId);
   }
 
@@ -124,8 +132,9 @@ export const applyNodePositionOverrides = ({
     }
     const anchor = clusterKey ? clusterDragAnchorByKey.get(clusterKey) : null;
     if (!anchor) continue;
-    if (isHorizontal) node.row = Math.max(node.row, anchor.node.row);
-    else node.column = Math.max(node.column, anchor.node.column);
+    if (anchor.node.commit.visualId === node.commit.visualId) continue;
+    node.row += anchor.node.row - anchor.originalRow;
+    node.column += anchor.node.column - anchor.originalColumn;
   }
 
   return pinnedNodeVisualIds;

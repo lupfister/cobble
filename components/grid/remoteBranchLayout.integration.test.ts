@@ -25,7 +25,7 @@ describe('remote branch layout integration', () => {
       .toString()
       .trim();
     const mainHead = execSync('git rev-parse main', { cwd: repoRoot }).toString().trim();
-    const mainLog = execSync('git log --first-parent --format="%H|%cI|%s" main', {
+    const mainLog = execSync('git log --first-parent --format="%H|%P|%cI|%s" main', {
       cwd: repoRoot,
       maxBuffer: 20 * 1024 * 1024,
     })
@@ -42,9 +42,9 @@ describe('remote branch layout integration', () => {
     const [remoteFullSha, remoteDate, remoteMessage, remoteAuthor] = remoteMeta;
 
     const directCommits: DirectCommit[] = [];
-    let previousSha: string | null = null;
     for (const line of mainLog) {
-      const [fullSha, date, message] = line.split('|');
+      const [fullSha, parentShasRaw, date, message] = line.split('|');
+      const parentSha = parentShasRaw.split(' ').filter(Boolean)[0] ?? null;
       directCommits.push({
         fullSha,
         sha: fullSha.slice(0, 7),
@@ -52,11 +52,10 @@ describe('remote branch layout integration', () => {
         message,
         author: 'dev',
         date,
-        parentSha: previousSha,
-        parentShas: previousSha ? [previousSha] : [],
+        parentSha,
+        parentShas: parentSha ? [parentSha] : [],
         childShas: [],
       });
-      previousSha = fullSha;
     }
 
     const remoteBranchName = 'cursor/commit-app-previews-7896';

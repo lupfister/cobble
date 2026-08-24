@@ -1512,6 +1512,15 @@ fn compute_repo_visual_snapshot_with_progress(
         .chain(branches.iter().map(|branch| branch.name.clone()))
         .collect();
     let mut branch_created_dates = HashMap::<String, String>::new();
+    let branch_parent_by_name: HashMap<String, String> = branches
+        .iter()
+        .filter_map(|branch| {
+            branch
+                .parent_branch
+                .as_ref()
+                .map(|parent| (branch.name.clone(), parent.clone()))
+        })
+        .collect();
     for branch in &branches {
         let date = branch
             .created_date
@@ -1534,6 +1543,7 @@ fn compute_repo_visual_snapshot_with_progress(
         &default_branch,
         &all_branch_names,
         &branch_created_dates,
+        &branch_parent_by_name,
         &merge_target_branch_by_commit_sha,
     )
     .map_err(|e| e.to_string())?;
@@ -2544,7 +2554,13 @@ async fn load_project_snapshot(
 
 #[tauri::command(rename_all = "camelCase")]
 async fn delete_project_cache(project_id: String) -> Result<(), String> {
-    run_blocking(move || delete_project_cache_rows(&project_id)).await
+    run_blocking(move || {
+        let normalized_project_id = normalize_repo_path_id(&project_id);
+        repo_git_gate::with_repo_git_lock(&normalized_project_id, || {
+            delete_project_cache_rows(&normalized_project_id)
+        })
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2575,11 +2591,9 @@ fn check_project_fingerprint_blocking(
     let stored_fingerprint = row.and_then(|(_, fingerprint)| fingerprint);
 
     repo_git_gate::with_repo_git_lock(&repo_path, || {
-        let probe = if let Some(cached) = repo_git_gate::cached_probe(&repo_path) {
-            cached
-        } else {
-            compute_repo_change_probe_inner(&repo_path)?
-        };
+        // This check decides whether the persisted project snapshot is current.
+        // Always probe Git here because the short-lived UI probe cache can predate a change.
+        let probe = compute_repo_change_probe_inner(&repo_path)?;
         let (current_fingerprint, changed) = if let Some(ref stored) = stored_fingerprint {
             if fingerprint_unchanged_via_probe(&repo_path, stored, &probe)? {
                 (stored.clone(), false)
@@ -6691,6 +6705,15 @@ fn get_all_repo_commits(repo_path: String) -> Result<Vec<DirectCommit>, String> 
         .chain(branches.iter().map(|branch| branch.name.clone()))
         .collect();
     let mut branch_created_dates = HashMap::<String, String>::new();
+    let branch_parent_by_name: HashMap<String, String> = branches
+        .iter()
+        .filter_map(|branch| {
+            branch
+                .parent_branch
+                .as_ref()
+                .map(|parent| (branch.name.clone(), parent.clone()))
+        })
+        .collect();
     for branch in &branches {
         let date = branch
             .created_date
@@ -6712,6 +6735,7 @@ fn get_all_repo_commits(repo_path: String) -> Result<Vec<DirectCommit>, String> 
         &default_branch,
         &all_branch_names,
         &branch_created_dates,
+        &branch_parent_by_name,
         &merge_target_branch_by_commit_sha,
     )
     .map_err(|e| e.to_string())

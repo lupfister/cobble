@@ -199,9 +199,23 @@ describe('computeBranchGridLayout large graph perf', () => {
       manuallyOpenedClumps: new Set([clusterKey!]),
     });
     expect(layout.renderNodes.length).toBeGreaterThan(240);
+    for (let leftIndex = 0; leftIndex < layout.renderNodes.length; leftIndex += 1) {
+      const left = layout.renderNodes[leftIndex]!;
+      for (let rightIndex = leftIndex + 1; rightIndex < layout.renderNodes.length; rightIndex += 1) {
+        const right = layout.renderNodes[rightIndex]!;
+        if (left.column !== right.column) continue;
+        const leftCluster = layout.clusterKeyByCommitId.get(left.commit.visualId);
+        const rightCluster = layout.clusterKeyByCommitId.get(right.commit.visualId);
+        if (leftCluster && leftCluster === rightCluster) continue;
+        expect(
+          Math.abs(left.row - right.row),
+          `${left.commit.visualId} and ${right.commit.visualId} share adjacent timeline columns`,
+        ).toBeGreaterThan(1);
+      }
+    }
     const parent = layout.renderNodes.find((node) => node.commit.id === checkedOutHeadSha)!;
     const worktree = layout.renderNodes.find((node) => node.commit.id === 'WORKING_TREE')!;
-    expect(worktree.row).toBe(parent.row + 1);
+    expect(worktree.row).toBeGreaterThan(parent.row);
     expect(worktree.column).toBeGreaterThan(parent.column);
 
     const renderedNodeByVisualId = new Map(
@@ -219,10 +233,14 @@ describe('computeBranchGridLayout large graph perf', () => {
           connectorChild.row,
           `${connector.id} points backward`,
         ).toBeGreaterThanOrEqual(connectorParent.row);
-        expect(
-          connectorChild.column,
-          `${connector.id} places its child above its parent`,
-        ).toBeGreaterThan(connectorParent.column);
+        const parentClusterKey = layout.clusterKeyByCommitId.get(connectorParent.commit.visualId);
+        const childClusterKey = layout.clusterKeyByCommitId.get(connectorChild.commit.visualId);
+        if (!parentClusterKey || parentClusterKey !== childClusterKey) {
+          expect(
+            connectorChild.column,
+            `${connector.id} places its child above its parent`,
+          ).toBeGreaterThan(connectorParent.column);
+        }
       }
       const points = getMapGridConnectorPolyline(
         connector.fromX,
@@ -232,9 +250,16 @@ describe('computeBranchGridLayout large graph perf', () => {
         connector.fromFace,
         connector.toFace,
       );
+      const connectorSourceClusterKey = connector.fromCommitVisualId
+        ? layout.clusterKeyByCommitId.get(connector.fromCommitVisualId)
+        : null;
       for (const blocker of layout.renderNodes) {
         if (blocker.commit.visualId === connector.fromCommitVisualId) continue;
         if (blocker.commit.visualId === connector.toCommitVisualId) continue;
+        if (
+          connectorSourceClusterKey
+          && layout.clusterKeyByCommitId.get(blocker.commit.visualId) === connectorSourceClusterKey
+        ) continue;
         const rect = {
           left: blocker.x,
           right: blocker.x + CARD_WIDTH,

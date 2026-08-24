@@ -281,7 +281,7 @@ function makeLayoutCacheKey(
   nodePositionOverrides: NodePositionOverrides = {},
 ): string {
   return [
-    'layout-v13-dependency-owned-placement',
+    'layout-v30-bounded-lane-conflict-solver',
     path,
     'horizontal',
     setSignature(manuallyOpenedClumps),
@@ -1087,27 +1087,68 @@ function App() {
     [persistRepoNodePositions, repoPath],
   );
 
-  const resetProjectNodePositions = useCallback(
-    (targetPath: string) => {
-      const normalizedPath = normalizePath(targetPath);
+  async function resetProjectNodePositions(targetPath: string) {
+    const normalizedPath = normalizePath(targetPath);
+    if (!normalizedPath) return;
+    try {
+      await invoke('delete_project_cache', { projectId: normalizedPath });
+      inflightProjectSnapshotsRef.current.delete(normalizedPath);
+      loadingProjectSnapshotsRef.current.delete(normalizedPath);
+      pendingFingerprintChecksRef.current.delete(normalizedPath);
+      delete projectSnapshotSignatureRef.current[normalizedPath];
+      delete projectHeadStateRef.current[normalizedPath];
+      delete projectQuickStateRef.current[normalizedPath];
+      setProjectSnapshots((previous) => {
+        if (!(normalizedPath in previous)) return previous;
+        const next = { ...previous };
+        delete next[normalizedPath];
+        return next;
+      });
       userDirtyNodePositionsRef.current.delete(normalizedPath);
       nodePositionPersistVersionByRepoRef.current = {
         ...nodePositionPersistVersionByRepoRef.current,
         [normalizedPath]: (nodePositionPersistVersionByRepoRef.current[normalizedPath] ?? 0) + 1,
       };
-      setNodePositionOverridesByRepo((previous) => ({
-        ...previous,
-        [normalizedPath]: {},
-      }));
+      setNodePositionOverridesByRepo((previous) => ({ ...previous, [normalizedPath]: {} }));
+      setManuallyOpenedGridClumpsByRepo((previous) => ({ ...previous, [normalizedPath]: new Set() }));
+      setManuallyClosedGridClumpsByRepo((previous) => ({ ...previous, [normalizedPath]: new Set() }));
       try {
         window.localStorage.removeItem(nodePositionsStorageKey(normalizedPath));
+        window.localStorage.removeItem(`optimistic_snapshot:${normalizedPath}`);
       } catch {
         // ignore localStorage failures
       }
-      void invoke('clear_repo_node_positions', { repoPath: normalizedPath });
-    },
-    [],
-  );
+      invalidateRepoLayoutCacheForPath(normalizedPath);
+      bumpRepoLayoutEpoch(normalizedPath);
+      const loadKey = projectLoadKey(normalizedPath);
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [loadKey]: { status: 'loading', phase: 'Re-importing project', progress: 1 },
+      }));
+      const record = await invoke<ProjectSnapshotRecord>('add_project_and_ingest', {
+        repoPath: normalizedPath,
+        forceRefresh: true,
+      });
+      const snapshot = toRepoVisualSnapshot(record);
+      if (!snapshot) throw new Error('Missing repo visual snapshot payload');
+      upsertProjectSnapshot(normalizedPath, snapshot, { force: true });
+      seedProjectSnapshotFromRecord(normalizedPath, snapshot);
+      if (sameRepoPath(currentRepoPathRef.current, normalizedPath)) {
+        applySnapshotToActiveState(normalizedPath, snapshot, {
+          force: true,
+          allowIncomingDirty: true,
+          needsLayoutRebuild: true,
+        });
+      }
+      setProjectLoadStates((previous) => ({
+        ...previous,
+        [loadKey]: { status: 'ready', phase: 'Ready', progress: 100 },
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setError(`Could not reset project layout: ${message}`);
+    }
+  }
 
 
   function quickStateSignature(state: RepoQuickState): string {
@@ -1385,19 +1426,21 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
           });
         } else {
           let needsIngest = false;
+          let fingerprintCheckFailed = false;
           if (shouldCheckFingerprint) {
             const check = await invoke<FingerprintCheckResult>('check_project_fingerprint', {
               projectId: normalizedPath,
             }).catch(() => null);
-            if (check?.changed) {
+            if (!check || check.changed) {
               needsIngest = true;
+              fingerprintCheckFailed = !check;
             }
           }
 
           if (needsIngest) {
             record = await invoke<ProjectSnapshotRecord>('add_project_and_ingest', {
               repoPath: normalizedPath,
-              forceRefresh: false,
+              forceRefresh: fingerprintCheckFailed,
             });
           } else {
             if (shouldCheckFingerprint && projectSnapshots[normalizedPath]?.loaded) {
@@ -1725,9 +1768,13 @@ function quickStateFromSnapshot(path: string, snapshot: RepoVisualSnapshot): Rep
     });
     try {
       window.localStorage.removeItem(nodePositionsStorageKey(normalizedPath));
+      window.localStorage.removeItem(`optimistic_snapshot:${normalizedPath}`);
     } catch {
       // ignore storage failures
     }
+    inflightProjectSnapshotsRef.current.delete(normalizedPath);
+    loadingProjectSnapshotsRef.current.delete(normalizedPath);
+    pendingFingerprintChecksRef.current.delete(normalizedPath);
     setProjects((previous) => {
       const next = previous.filter((project) => project.path !== normalizedPath);
       try {
@@ -2697,8 +2744,8 @@ async function reconcileSnapshotForProjectSwitch(
           return reconcileSnapshotForProjectSwitch(normalizedPath, localSnapshot);
         }
       }
-    } catch (e) {
-      console.warn('[optimistic-cache] failed to load or validate from localStorage:', e);
+    } catch (error) {
+      console.warn('[optimistic-cache] failed to restore snapshot:', error);
     }
 
     let snapshot = await loadProjectSnapshot(normalizedPath, false, true);
