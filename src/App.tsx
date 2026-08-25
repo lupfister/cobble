@@ -37,6 +37,7 @@ import {
   type MergeCheckedOutRefOptions,
 } from './reconcileCheckedOutHead';
 import { visibleWorktrees } from '../lib/worktreePaths';
+import { buildWorktreeCenteredGraph } from '../lib/worktreeCenteredGraph';
 import {
   applyMutationPatch,
   outcomeFromCheckout,
@@ -5286,14 +5287,38 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     () => applyBranchParents(enrichedBranches, branchParentByName, defaultBranch),
     [enrichedBranches, branchParentByName, defaultBranch],
   );
+  const worktreeCenteredGraph = useMemo(
+    () => buildWorktreeCenteredGraph({
+      branches: branchesForLayout,
+      worktreeBranchNames: sortedWorktrees
+        .map((worktree) => worktree.branchName)
+        .filter((branchName): branchName is string => Boolean(branchName)),
+      directCommits: enrichedDirectCommits,
+      unpushedDirectCommits: enrichedUnpushedDirectCommits,
+      branchCommitPreviews: enrichedBranchCommitPreviews,
+      mergeNodes,
+      defaultBranch,
+      branchUniqueAheadCounts: enrichedBranchUniqueAheadCounts,
+    }),
+    [
+      branchesForLayout,
+      sortedWorktrees,
+      enrichedDirectCommits,
+      enrichedUnpushedDirectCommits,
+      enrichedBranchCommitPreviews,
+      mergeNodes,
+      defaultBranch,
+      enrichedBranchUniqueAheadCounts,
+    ],
+  );
   const enrichedBranchParentByName = useMemo(() => {
     const map: Record<string, string | null> = { [defaultBranch]: null };
-    for (const branch of branchesForLayout) {
+    for (const branch of worktreeCenteredGraph.branches) {
       if (branch.name === defaultBranch) continue;
       map[branch.name] = branch.parentBranch ?? null;
     }
     return map;
-  }, [branchesForLayout, defaultBranch]);
+  }, [worktreeCenteredGraph.branches, defaultBranch]);
   const activeLayoutEpoch = repoPath
     ? (layoutEpochByRepo[normalizePath(repoPath)] ?? 0)
     : 0;
@@ -5305,12 +5330,12 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
         checkedOutBranch: visualCheckedOutRef?.branchName ?? '',
         checkedOutHead: visualCheckedOutRef?.headSha ?? '',
         worktreeSessionSignature: formatWorktreeSessionLayoutSignature(worktreeSessions),
-        branchRowsSignature: branchesForLayout
+        branchRowsSignature: worktreeCenteredGraph.branches
           .map((branch) => `${branch.name}:${branch.headSha}:${branch.commitsAhead}:${branch.commitsBehind}:${branch.parentBranch ?? ''}`)
           .join('|'),
-        directCommitFingerprint: hashCommitShaList(enrichedDirectCommits),
-        unpushedCommitFingerprint: hashCommitShaList(enrichedUnpushedDirectCommits),
-        mergeNodesSignature: mergeNodes
+        directCommitFingerprint: hashCommitShaList(worktreeCenteredGraph.directCommits),
+        unpushedCommitFingerprint: hashCommitShaList(worktreeCenteredGraph.unpushedDirectCommits),
+        mergeNodesSignature: worktreeCenteredGraph.mergeNodes
           .map((node) => `${node.fullSha}:${node.targetBranch}:${node.targetCommitSha}`)
           .join('|'),
       }),
@@ -5320,25 +5345,22 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
       visualCheckedOutRef?.branchName,
       visualCheckedOutRef?.headSha,
       worktreeSessions,
-      branchesForLayout,
-      enrichedDirectCommits,
-      enrichedUnpushedDirectCommits,
-      mergeNodes,
+      worktreeCenteredGraph,
     ],
   );
   const layoutRevision = useMemo(
     () => ({
       repoPath: repoPath ?? '',
       graphLayoutSignature,
-      branchesForLayout,
-      mergeNodes,
-      enrichedDirectCommits,
-      enrichedUnpushedDirectCommits,
+      branchesForLayout: worktreeCenteredGraph.branches,
+      mergeNodes: worktreeCenteredGraph.mergeNodes,
+      enrichedDirectCommits: worktreeCenteredGraph.directCommits,
+      enrichedUnpushedDirectCommits: worktreeCenteredGraph.unpushedDirectCommits,
       unpushedCommitShasByBranch,
       defaultBranch,
-      enrichedBranchCommitPreviews,
+      enrichedBranchCommitPreviews: worktreeCenteredGraph.branchCommitPreviews,
       enrichedBranchParentByName,
-      enrichedBranchUniqueAheadCounts,
+      enrichedBranchUniqueAheadCounts: worktreeCenteredGraph.branchUniqueAheadCounts,
       manuallyOpenedGridClumps,
       manuallyClosedGridClumps,
       gridFocusSha,
@@ -5350,15 +5372,10 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
     [
       repoPath,
       graphLayoutSignature,
-      branchesForLayout,
-      mergeNodes,
-      enrichedDirectCommits,
-      enrichedUnpushedDirectCommits,
+      worktreeCenteredGraph,
       unpushedCommitShasByBranch,
       defaultBranch,
-      enrichedBranchCommitPreviews,
       enrichedBranchParentByName,
-      enrichedBranchUniqueAheadCounts,
       manuallyOpenedGridClumps,
       manuallyClosedGridClumps,
       gridFocusSha,
@@ -6735,16 +6752,16 @@ function finalizeProjectSwitchSnapshot(path: string, snapshot: RepoVisualSnapsho
             <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
               <div className="pointer-events-none absolute left-0 right-0 top-0 z-40 h-12" />
               <BranchGridMapView
-                branches={branchesForLayout}
-                mergeNodes={mergeNodes}
-                directCommits={enrichedDirectCommits}
-                unpushedDirectCommits={enrichedUnpushedDirectCommits}
+                branches={worktreeCenteredGraph.branches}
+                mergeNodes={worktreeCenteredGraph.mergeNodes}
+                directCommits={worktreeCenteredGraph.directCommits}
+                unpushedDirectCommits={worktreeCenteredGraph.unpushedDirectCommits}
                 unpushedCommitShasByBranch={unpushedCommitShasByBranch}
                 openPRs={openPRs}
                 defaultBranch={defaultBranch}
-                branchCommitPreviews={enrichedBranchCommitPreviews}
+                branchCommitPreviews={worktreeCenteredGraph.branchCommitPreviews}
                 branchParentByName={enrichedBranchParentByName}
-                branchUniqueAheadCounts={enrichedBranchUniqueAheadCounts}
+                branchUniqueAheadCounts={worktreeCenteredGraph.branchUniqueAheadCounts}
                 gridSearchQuery={gridSearchQuery}
                 gridSearchJumpToken={gridSearchJumpToken}
                 gridSearchJumpDirection={gridSearchJumpDirection}

@@ -133,9 +133,9 @@ function CommitControls({
   const usesGeneratedBranchAction = Boolean(selectedWorktreeSession?.hasUncommittedChanges);
 
   const [checkoutAction, setCheckoutAction] = useState<'checkout' | 'new-worktree'>(() => {
-    const saved = localStorage.getItem('cobble:last-checkout-action');
+    const saved = localStorage.getItem('cobble:worktree-centered-checkout-action');
     if (saved === 'checkout' || saved === 'new-worktree') return saved;
-    return 'checkout';
+    return 'new-worktree';
   });
 
   // Close dropdown on click outside
@@ -463,7 +463,7 @@ function CommitControls({
                     type="button"
                     onClick={() => {
                       setCheckoutAction('checkout');
-                      localStorage.setItem('cobble:last-checkout-action', 'checkout');
+                      localStorage.setItem('cobble:worktree-centered-checkout-action', 'checkout');
                       setActiveDropdown(null);
                       void runCheckoutAction('checkout');
                     }}
@@ -475,7 +475,7 @@ function CommitControls({
                     type="button"
                     onClick={() => {
                       setCheckoutAction('new-worktree');
-                      localStorage.setItem('cobble:last-checkout-action', 'new-worktree');
+                      localStorage.setItem('cobble:worktree-centered-checkout-action', 'new-worktree');
                       setActiveDropdown(null);
                       void runCheckoutAction('new-worktree');
                     }}
@@ -570,7 +570,7 @@ function CommitControls({
                       type="button"
                       onClick={() => {
                         setCheckoutAction('checkout');
-                        localStorage.setItem('cobble:last-checkout-action', 'checkout');
+                        localStorage.setItem('cobble:worktree-centered-checkout-action', 'checkout');
                         setActiveDropdown(null);
                         void runCheckoutAction('checkout');
                       }}
@@ -582,7 +582,7 @@ function CommitControls({
                       type="button"
                       onClick={() => {
                         setCheckoutAction('new-worktree');
-                        localStorage.setItem('cobble:last-checkout-action', 'new-worktree');
+                        localStorage.setItem('cobble:worktree-centered-checkout-action', 'new-worktree');
                         setActiveDropdown(null);
                         void runCheckoutAction('new-worktree');
                       }}
